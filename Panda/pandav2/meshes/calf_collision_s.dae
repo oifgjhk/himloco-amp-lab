@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <asset>
+    <contributor>
+      <author>Blender User</author>
+      <authoring_tool>Blender 2.79.0</authoring_tool>
+    </contributor>
+    <created>2025-12-29T15:48:14</created>
+    <modified>2025-12-29T15:48:14</modified>
+    <unit name="meter" meter="1"/>
+    <up_axis>Z_UP</up_axis>
+  </asset>
+  <library_cameras>
+    <camera id="Camera-camera" name="Camera">
+      <optics>
+        <technique_common>
+          <perspective>
+            <xfov sid="xfov">49.13434</xfov>
+            <aspect_ratio>1.777778</aspect_ratio>
+            <znear sid="znear">0.1</znear>
+            <zfar sid="zfar">100</zfar>
+          </perspective>
+        </technique_common>
+      </optics>
+      <extra>
+        <technique profile="blender">
+          <shiftx sid="shiftx" type="float">0</shiftx>
+          <shifty sid="shifty" type="float">0</shifty>
+          <YF_dofdist sid="YF_dofdist" type="float">0</YF_dofdist>
+        </technique>
+      </extra>
+    </camera>
+  </library_cameras>
+  <library_lights>
+    <light id="Lamp-light" name="Lamp">
+      <technique_common>
+        <point>
+          <color sid="color">1 1 1</color>
+          <constant_attenuation>1</constant_attenuation>
+          <linear_attenuation>0</linear_attenuation>
+          <quadratic_attenuation>0.00111109</quadratic_attenuation>
+        </point>
+      </technique_common>
+      <extra>
+        <technique profile="blender">
+          <type sid="type" type="int">0</type>
+          <flag sid="flag" type="int">0</flag>
+          <mode sid="mode" type="int">8192</mode>
+          <gamma sid="blender_gamma" type="float">1</gamma>
+          <red sid="red" type="float">1</red>
+          <green sid="green" type="float">1</green>
+          <blue sid="blue" type="float">1</blue>
+          <shadow_r sid="blender_shadow_r" type="float">0</shadow_r>
+          <shadow_g sid="blender_shadow_g" type="float">0</shadow_g>
+          <shadow_b sid="blender_shadow_b" type="float">0</shadow_b>
+          <energy sid="blender_energy" type="float">1</energy>
+          <dist sid="blender_dist" type="float">29.99998</dist>
+          <spotsize sid="spotsize" type="float">75</spotsize>
+          <spotblend sid="spotblend" type="float">0.15</spotblend>
+          <halo_intensity sid="blnder_halo_intensity" type="float">1</halo_intensity>
+          <att1 sid="att1" type="float">0</att1>
+          <att2 sid="att2" type="float">1</att2>
+          <falloff_type sid="falloff_type" type="int">2</falloff_type>
+          <clipsta sid="clipsta" type="float">1.000799</clipsta>
+          <clipend sid="clipend" type="float">30.002</clipend>
+          <bias sid="bias" type="float">1</bias>
+          <soft sid="soft" type="float">3</soft>
+          <compressthresh sid="compressthresh" type="float">0.04999995</compressthresh>
+          <bufsize sid="bufsize" type="int">2880</bufsize>
+          <samp sid="samp" type="int">3</samp>
+          <buffers sid="buffers" type="int">1</buffers>
+          <filtertype sid="filtertype" type="int">0</filtertype>
+          <bufflag sid="bufflag" type="int">0</bufflag>
+          <buftype sid="buftype" type="int">2</buftype>
+          <ray_samp sid="ray_samp" type="int">1</ray_samp>
+          <ray_sampy sid="ray_sampy" type="int">1</ray_sampy>
+          <ray_sampz sid="ray_sampz" type="int">1</ray_sampz>
+          <ray_samp_type sid="ray_samp_type" type="int">0</ray_samp_type>
+          <area_shape sid="area_shape" type="int">1</area_shape>
+          <area_size sid="area_size" type="float">0.1</area_size>
+          <area_sizey sid="area_sizey" type="float">0.1</area_sizey>
+          <area_sizez sid="area_sizez" type="float">1</area_sizez>
+          <adapt_thresh sid="adapt_thresh" type="float">0.000999987</adapt_thresh>
+          <ray_samp_method sid="ray_samp_method" type="int">1</ray_samp_method>
+          <shadhalostep sid="shadhalostep" type="int">0</shadhalostep>
+          <sun_effect_type sid="sun_effect_type" type="int">0</sun_effect_type>
+          <skyblendtype sid="skyblendtype" type="int">1</skyblendtype>
+          <horizon_brightness sid="horizon_brightness" type="float">1</horizon_brightness>
+          <spread sid="spread" type="float">1</spread>
+          <sun_brightness sid="sun_brightness" type="float">1</sun_brightness>
+          <sun_size sid="sun_size" type="float">1</sun_size>
+          <backscattered_light sid="backscattered_light" type="float">1</backscattered_light>
+          <sun_intensity sid="sun_intensity" type="float">1</sun_intensity>
+          <atm_turbidity sid="atm_turbidity" type="float">2</atm_turbidity>
+          <atm_extinction_factor sid="atm_extinction_factor" type="float">1</atm_extinction_factor>
+          <atm_distance_factor sid="atm_distance_factor" type="float">1</atm_distance_factor>
+          <skyblendfac sid="skyblendfac" type="float">1</skyblendfac>
+          <sky_exposure sid="sky_exposure" type="float">1</sky_exposure>
+          <sky_colorspace sid="sky_colorspace" type="int">0</sky_colorspace>
+        </technique>
+      </extra>
+    </light>
+  </library_lights>
+  <library_images/>
+  <library_geometries>
+    <geometry id="calf_collision_s-mesh" name="calf collision s">
+      <mesh>
+        <source id="calf_collision_s-mesh-positions">
+          <float_array id="calf_collision_s-mesh-positions-array" count="198">-0.3197479 -0.02399998 0.02270871 -0.3117491 -0.02399998 0.01506817 -0.3197479 0.02399998 0.02270871 -0.3117491 0.02399998 0.01506817 -0.3015698 0.02399998 0.004291474 -0.3015698 -0.02399998 0.004291474 -0.289673 0.02399998 -0.004552781 -0.289673 -0.02399998 -0.004552781 -0.2764205 0.02399998 -0.01119565 -0.2764205 -0.02399998 -0.01119565 -0.2622154 0.02399998 -0.01543503 -0.2622154 -0.02399998 -0.01543503 -0.2474898 0.02399998 -0.01714199 -0.2474898 -0.02399998 -0.01714199 -0.2174652 0.02399998 -0.01685822 -0.2174652 -0.02399998 -0.01685822 -0.1875465 0.02399998 -0.01432305 -0.1875465 -0.02399998 -0.01432305 -0.1579023 0.02399998 -0.00955075 -0.1579023 -0.02399998 -0.00955075 -0.1286995 0.02399998 -0.002568244 -0.1286995 -0.02399998 -0.002568244 -0.08466875 0.02399998 0.009723782 -0.08466875 -0.02399998 0.009723782 -0.0640555 -0.02399998 0.014889 -0.0640555 0.02399998 0.014889 -0.04317331 -0.02399998 0.01882898 -0.04317331 0.02399998 0.01882898 -0.04242199 0.02399998 -0.02265489 -0.04242199 -0.02399998 -0.02265489 -0.06372278 0.02399998 -0.02472412 -0.06372278 -0.02399998 -0.02472412 -0.08482706 0.02399998 -0.02827584 -0.08482706 -0.02399998 -0.02827584 -0.1206117 0.02399998 -0.03559225 -0.1206117 -0.02399998 -0.03559225 -0.1609349 -0.02399998 -0.04238629 -0.1609349 0.02399998 -0.04238629 -0.2016326 -0.02399998 -0.04636311 -0.2016326 0.02399998 -0.04636311 -0.2425083 -0.02399998 -0.04750347 -0.2425083 0.02399998 -0.04750347 -0.2833645 -0.02399998 -0.04580187 -0.2833645 0.02399998 -0.04580187 -0.315051 -0.02399998 -0.04203319 -0.315051 0.02399998 -0.04203319 -0.3463097 -0.02399998 -0.03561931 -0.3463097 0.02399998 -0.03561931 -0.3518375 -0.02399998 -0.03364938 -0.3518375 0.02399998 -0.03364938 -0.3568761 -0.02399998 -0.03064095 -0.3568761 0.02399998 -0.03064095 -0.3581495 -0.02399998 -0.02905982 -0.3581495 0.02399998 -0.02905982 -0.3584825 -0.02399998 -0.02705711 -0.3584825 0.02399998 -0.02705711 -0.3577896 -0.02399998 -0.02514886 -0.3577896 0.02399998 -0.02514886 -0.3253746 0.02399998 0.02173674 -0.3253746 -0.02399998 0.02173674 -0.3242377 -0.02399998 0.02283287 -0.3242377 0.02399998 0.02283287 -0.3227652 -0.02399998 0.02340364 -0.3227652 0.02399998 0.02340364 -0.3211866 -0.02399998 0.02335995 -0.3211866 0.02399998 0.02335995</float_array>
+          <technique_common>
+            <accessor source="#calf_collision_s-mesh-positions-array" count="66" stride="3">
+              <param name="X" type="float"/>
+              <param name="Y" type="float"/>
+              <param name="Z" type="float"/>
+            </accessor>
+          </technique_common>
+        </source>
+        <source id="calf_collision_s-mesh-normals">
+          <float_array id="calf_collision_s-mesh-normals-array" count="261">0.6907285 0 0.7231143 0.726969 0 0.6866704 0.7269691 0 0.6866703 0.5966137 0 0.8025286 0.5966137 0 0.8025287 0.4481098 0 0.8939785 0.4481099 0 0.8939786 0.2859776 0 0.9582363 0.1151464 0 0.9933485 0.1151466 0 0.9933485 -0.009450972 0 0.9999554 -0.08443242 0 0.9964292 -0.158939 0 0.9872884 -0.1589389 0 0.9872884 -0.2325497 0 0.9725846 -0.2325497 0 0.9725846 -0.2688892 0 0.9631711 -0.2688892 0 0.9631711 -0.2430629 0 0.9700105 -0.243063 0 0.9700105 -0.1854054 0 0.9826622 -0.1854056 0 0.9826622 0.9998361 0 0.0181083 0.09668612 0 -0.995315 0.09668636 0 -0.995315 0.16596 0 -0.9861325 0.1659604 0 -0.9861325 0.2003142 0 -0.9797317 0.2003141 0 -0.9797317 0.1661471 0 -0.986101 0.1661469 0 -0.986101 0.09725242 0 -0.9952598 0.09725219 0 -0.9952598 0.02788752 0 -0.9996111 0.02788728 0 -0.9996111 -0.04161161 0 -0.999134 -0.118104 0 -0.9930012 -0.2009997 0 -0.9795913 -0.2009996 0 -0.9795914 -0.3356913 0 -0.9419721 -0.5126464 0 -0.8585999 -0.5126476 0 -0.8585992 -0.7788348 0 -0.6272291 -0.9864481 0 -0.1640743 -0.9864481 0 -0.1640735 -0.9399486 0 0.3413163 -0.8225555 0 0.5686849 -0.694098 0 0.7198806 -0.6940964 0 0.7198821 -0.361413 0 0.9324058 -0.3614104 0 0.932407 0.02764976 0 0.9996177 0.02765285 0 0.9996176 0.4123873 0 0.9110086 0 1 -1.73663e-7 0 1 0 0 1 0 0 1 0 0 1 7.54089e-7 0 1 0 0 1 0 0 1 0 0 1 0 0 1 7.53807e-6 0 1 3.59567e-6 0 1 -1.36158e-7 0 1 -5.733e-7 0 1 7.18589e-7 0 1 1.3075e-7 0 1 -1.21404e-7 0 1 0 0 1 1.37854e-7 0 -1 0 0 -1 0 0 -1 0 0 -1 3.76915e-6 0 -1 0 0 -1 0 0 -1 -1.33733e-7 0 -1 7.54089e-7 0 -1 0 0 -1 8.99022e-7 0 -1 1.31118e-6 0 -1 -5.27106e-7 0 -1 1.31514e-7 0 -1 -1.31903e-7 0 -1 1.50761e-5</float_array>
+          <technique_common>
+            <accessor source="#calf_collision_s-mesh-normals-array" count="87" stride="3">
+              <param name="X" type="float"/>
+              <param name="Y" type="float"/>
+              <param name="Z" type="float"/>
+            </accessor>
+          </technique_common>
+        </source>
+        <vertices id="calf_collision_s-mesh-vertices">
+          <input semantic="POSITION" source="#calf_collision_s-mesh-positions"/>
+        </vertices>
+        <triangles count="128">
+          <input semantic="VERTEX" source="#calf_collision_s-mesh-vertices" offset="0"/>
+          <input semantic="NORMAL" source="#calf_collision_s-mesh-normals" offset="1"/>
+          <p>0 0 1 0 2 0 2 0 1 0 3 0 3 1 1 1 4 1 4 2 1 2 5 2 4 3 5 3 6 3 6 4 5 4 7 4 6 5 7 5 8 5 8 6 7 6 9 6 8 7 9 7 10 7 10 7 9 7 11 7 10 8 11 8 12 8 12 9 11 9 13 9 12 10 13 10 14 10 14 10 13 10 15 10 14 11 15 11 16 11 16 11 15 11 17 11 16 12 17 12 18 12 18 13 17 13 19 13 18 14 19 14 20 14 20 15 19 15 21 15 22 16 20 16 23 16 23 17 20 17 21 17 22 18 23 18 24 18 22 19 24 19 25 19 25 20 24 20 26 20 25 21 26 21 27 21 28 22 27 22 29 22 29 22 27 22 26 22 28 23 29 23 30 23 30 24 29 24 31 24 30 25 31 25 32 25 32 26 31 26 33 26 34 27 32 27 35 27 35 28 32 28 33 28 34 29 35 29 36 29 34 30 36 30 37 30 37 31 36 31 38 31 37 32 38 32 39 32 39 33 38 33 40 33 39 34 40 34 41 34 41 35 40 35 42 35 41 35 42 35 43 35 43 36 42 36 44 36 43 36 44 36 45 36 45 37 44 37 46 37 45 38 46 38 47 38 47 39 46 39 48 39 47 39 48 39 49 39 49 40 48 40 50 40 49 41 50 41 51 41 51 42 50 42 52 42 51 42 52 42 53 42 53 43 52 43 54 43 53 44 54 44 55 44 55 45 54 45 56 45 55 45 56 45 57 45 58 46 57 46 59 46 59 46 57 46 56 46 58 47 59 47 60 47 58 48 60 48 61 48 61 49 60 49 62 49 61 50 62 50 63 50 63 51 62 51 64 51 63 52 64 52 65 52 65 53 64 53 0 53 65 53 0 53 2 53 4 54 6 54 45 54 45 55 6 55 43 55 51 56 3 56 49 56 49 57 3 57 4 57 49 58 4 58 47 58 47 59 4 59 45 59 6 60 8 60 43 60 43 61 8 61 10 61 43 62 10 62 41 62 41 56 10 56 12 56 41 56 12 56 39 56 63 63 65 63 2 63 53 64 55 64 51 64 51 56 55 56 57 56 51 56 57 56 3 56 3 65 57 65 58 65 3 66 58 66 2 66 2 67 58 67 61 67 2 56 61 56 63 56 12 68 14 68 39 68 39 56 14 56 16 56 39 56 16 56 37 56 37 69 16 69 18 69 37 70 18 70 34 70 34 56 18 56 20 56 34 56 20 56 32 56 32 56 20 56 22 56 32 56 22 56 30 56 30 56 22 56 25 56 30 71 25 71 28 71 28 56 25 56 27 56 38 72 15 72 40 72 40 73 15 73 13 73 40 74 13 74 42 74 62 75 60 75 59 75 13 73 11 73 42 73 42 76 11 76 9 76 42 77 9 77 44 77 44 73 9 73 7 73 44 73 7 73 46 73 46 78 7 78 5 78 46 79 5 79 48 79 48 80 5 80 1 80 54 81 52 81 56 81 56 82 52 82 50 82 56 83 50 83 59 83 29 84 26 84 31 84 31 73 26 73 24 73 31 73 24 73 33 73 33 73 24 73 23 73 33 73 23 73 35 73 35 73 23 73 21 73 35 73 21 73 36 73 36 73 21 73 19 73 36 73 19 73 38 73 38 85 19 85 17 85 38 73 17 73 15 73 64 86 62 86 0 86 0 73 62 73 59 73 0 73 59 73 1 73 1 73 59 73 50 73 1 73 50 73 48 73</p>
+        </triangles>
+      </mesh>
+    </geometry>
+  </library_geometries>
+  <library_controllers/>
+  <library_visual_scenes>
+    <visual_scene id="Scene" name="Scene">
+      <node id="Camera" name="Camera" type="NODE">
+        <matrix sid="transform">0.6859207 -0.3240135 0.6515582 7.481132 0.7276763 0.3054208 -0.6141704 -6.50764 0 0.8953956 0.4452714 5.343665 0 0 0 1</matrix>
+        <instance_camera url="#Camera-camera"/>
+      </node>
+      <node id="Lamp" name="Lamp" type="NODE">
+        <matrix sid="transform">-0.2908646 -0.7711008 0.5663932 4.076245 0.9551712 -0.1998834 0.2183912 1.005454 -0.05518906 0.6045247 0.7946723 5.903862 0 0 0 1</matrix>
+        <instance_light url="#Lamp-light"/>
+      </node>
+      <node id="calf_collision_s" name="calf_collision_s" type="NODE">
+        <matrix sid="transform">1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1</matrix>
+        <instance_geometry url="#calf_collision_s-mesh" name="calf_collision_s"/>
+      </node>
+    </visual_scene>
+  </library_visual_scenes>
+  <scene>
+    <instance_visual_scene url="#Scene"/>
+  </scene>
+</COLLADA>
