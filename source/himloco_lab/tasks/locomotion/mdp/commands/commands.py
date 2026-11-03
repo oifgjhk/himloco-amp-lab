@@ -13,6 +13,7 @@ from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG, GREEN_ARROW_X_MARKE
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
     from .commands_cfg import UniformLevelVelocityCommandCfg
+from ..utils import sample_disjoint_intervals
 
 
 
@@ -100,6 +101,18 @@ class UniformLevelVelocityCommand(UniformVelocityCommand):
                     f"[terrain_type {terrain_type:2d}] {terrain_name:>22s} "
                     f"limit = [{limit[0]:.2f}, {limit[1]:.2f}]"
                 )
+        #记录单局内机器人的历史最大移动距离 & 速度指令矢量累加
+        self.max_move_distance = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.commands_xy_accumulation = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device)
+
+        # 计算有效地形边长（用于动态重采样下界计算）
+        terrain_cfg = self._env.scene.terrain.cfg
+        if terrain_cfg.terrain_type == "generator" and terrain_cfg.terrain_generator is not None:
+            gen_cfg = terrain_cfg.terrain_generator
+            border = getattr(gen_cfg, "sub_terrain_border_width", 0.0) or 0.0
+            self.terrain_length = max(0.0, gen_cfg.size[0] - 2.0 * border)
+        else:
+            self.terrain_length = 0.0
 
     def __str__(self) -> str:
         """Return a string representation of the command generator."""
@@ -110,6 +123,14 @@ class UniformLevelVelocityCommand(UniformVelocityCommand):
         if self.cfg.heading_command:
             msg += f"\tHeading probability: {self.cfg.rel_heading_envs}\n"
         return msg
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
+        if env_ids is None:
+            env_ids = slice(None)
+        #在环境 reset 时清零过程最大距离与累积指令
+        self.max_move_distance[env_ids] = 0.0
+        self.commands_xy_accumulation[env_ids] = 0.0
+        return super().reset(env_ids)
 
     def _resample_command(self, env_ids: Sequence[int]):
         if not isinstance(env_ids, torch.Tensor):
@@ -169,6 +190,36 @@ class UniformLevelVelocityCommand(UniformVelocityCommand):
                                             self.cfg.min_command_norm).unsqueeze(1)
         self.vel_command_b[env_ids_tensor, 2] *= (torch.abs(self.vel_command_b[env_ids_tensor, 2]) > \
                                             self.cfg.min_command_norm)
+        # 若开启 dynamic_resample_commands 且在地形生成器模式下，
+        # 对非静止、非纯旋转环境的 X 轴速度应用 sample_disjoint_intervals，确保剩余时间内速度足够走出地形
+        if getattr(self.cfg, "dynamic_resample_commands", False) and self.terrain_length > 0.0:
+            mean_resample_dt = 0.5 * (self.cfg.resampling_time_range[0] + self.cfg.resampling_time_range[1])
+            remaining_dist = torch.clip(
+                0.625 * self.terrain_length - torch.norm(self.commands_xy_accumulation[env_ids], dim=1) * mean_resample_dt,
+                min=0.0,
+            )
+            rem_steps = (self._env.max_episode_length - self._env.episode_length_buf[env_ids] + 1).clamp(min=1)
+            vel_low_bound = torch.clip(remaining_dist / (rem_steps * self._env.step_dt + 1e-9), min=0.0)
+
+            # 仅对有线速度需求的环境（非 standing 且当前 vx != 0）应用下界约束
+            active_vx_mask = (~self.is_standing_env[env_ids]) & (torch.abs(self.vel_command_b[env_ids, 0]) > 1e-3)
+            active_ids = env_ids[active_vx_mask]
+            if len(active_ids) > 0:
+                # 获取这些环境当前允许的 vx 上下限（若已有 terrain_vel_current 则取对应范围，否则取 cfg.ranges.lin_vel_x）
+                if hasattr(self, "env_lin_x_ranges"):
+                    cfg_min = self.env_lin_x_ranges[active_ids, 0]
+                    cfg_max = self.env_lin_x_ranges[active_ids, 1]
+                else:
+                    cfg_min = torch.full((len(active_ids),), self.cfg.ranges.lin_vel_x[0], device=self.device)
+                    cfg_max = torch.full((len(active_ids),), self.cfg.ranges.lin_vel_x[1], device=self.device)
+
+                bound = torch.minimum(vel_low_bound[active_vx_mask], 0.8 * torch.maximum(cfg_max.abs(), cfg_min.abs()))
+                self.vel_command_b[active_ids, 0] = sample_disjoint_intervals(
+                    active_ids, bound, cfg_min, cfg_max, self.device
+                )
+
+        # 4. 新增：累加每次重采样后的 XY 平面速度指令矢量（静止环境已为 0）
+        self.commands_xy_accumulation[env_ids] += self.vel_command_b[env_ids, :2]
         
     def _update_command(self):
         """Post-processes the velocity command.
@@ -202,6 +253,10 @@ class UniformLevelVelocityCommand(UniformVelocityCommand):
         
         standing_env_ids = self.is_standing_env.nonzero(as_tuple=False).flatten()
         self.vel_command_b[standing_env_ids, :] = 0.0
+
+        # 在每个仿真步实时更新 Episode 内的历史最大移动半径
+        current_dist = torch.norm(self.robot.data.root_pos_w[:, :2] - self._env.scene.env_origins[:, :2], dim=1)
+        self.max_move_distance = torch.maximum(self.max_move_distance, current_dist)
     """Debug Visualization"""
 
     # def _set_debug_vis_impl(self, debug_vis: bool):

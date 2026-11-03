@@ -45,8 +45,22 @@ class AMPPPORunnerCfg(AMPOnPolicyRunnerCfg):
         amp_replay_buffer_size=1000000,
     )
     amp_motion_files = _AMP_MOTION_FILES
-    amp_reward_coef = 0.3 #0.06 #0.03 # #0.3 #0.5 * 0.02 #0.3
+    amp_reward_coef = 0.05 #0.06 #0.03 # #0.3 #0.5 * 0.02 #0.3
     """Coefficient for AMP style reward."""
     amp_task_reward_lerp = 0.7 #0.5 #0.3 #0.7
     """Ratio to lerp between task reward and style reward."""
     min_normalized_std = [0.05, 0.02, 0.05] * 4
+
+    # --- 新增训练模式切换开关 ---
+    train_mode: str = "bptt"             # 可选: "ppo" (传统无模型PPO) | "bptt" (SuperMimic 世界模型+BPTT)
+    
+    # --- SuperMimic 世界模型与 BPTT 超参数 (对照论文 Table A.5) ---
+    wm_window_len: int = 8               # k = 8 步自回归拟合窗口
+    bptt_horizon: int = 32               # H = 32 步想象滚动时域
+    wm_lr: float = 2e-4                  # 世界模型与 BPTT 学习率 2e-4
+    wm_buffer_capacity: int = 1000       # 每个环境存储 1000 步历史
+    wm_batches_per_update: int = 10      # 每次更新采样 10 个 batch (每个 2048 窗口)
+    wm_batch_size: int = 2048
+    bptt_batch_size: int = 4096          # 每次 BPTT 采样 4096 条想象轨迹
+    bptt_action_noise_std: float = 0.1   # 仿真采样时的探索噪声 N(0, 0.1^2)
+    bptt_sim_steps_per_update: int = 2   # 对应论文 UTD (Update-to-Data ratio) = 0.4 ~ 0.5

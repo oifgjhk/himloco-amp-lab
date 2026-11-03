@@ -207,6 +207,18 @@ class AMPOnPolicyRunnerCfg(HIMOnPolicyRunnerCfg):
     min_normalized_std: float = 0.01
     """Minimum normalized action standard deviation (scaled by joint range)."""
 
+    # --- 新增：SuperMimic 训练模式与默认超参数 ---
+    train_mode: str = "ppo"              # 默认 "ppo"，在具体机器人 cfg 中可覆写为 "bptt"
+    wm_window_len: int = 8
+    bptt_horizon: int = 32
+    wm_lr: float = 2e-4
+    wm_buffer_capacity: int = 1000
+    wm_batches_per_update: int = 10
+    wm_batch_size: int = 2048
+    bptt_batch_size: int = 4096
+    bptt_action_noise_std: float = 0.1
+    bptt_sim_steps_per_update: int = 2
+
 @configclass
 class AMPPPOAlgorithmCfg(HIMPPPOAlgorithmCfg):
     """AMP PPO algorithm configuration."""

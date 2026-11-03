@@ -230,13 +230,20 @@ def feet_height(
 ) -> torch.Tensor:
     """Get the height of the feet above the ground."""
     sensors = [env.scene.sensors[name] for name in scan_sensor_names]
-    feet_height = torch.stack(
-        [
-            sensor.data.pos_w[:, 2] - sensor.data.ray_hits_w[..., 2].squeeze()
-            for sensor in sensors
-        ],
-        dim=-1,
-    )
+    # feet_height = torch.stack(
+    #     [
+    #         sensor.data.pos_w[:, 2] - sensor.data.ray_hits_w[..., 2].squeeze()
+    #         for sensor in sensors
+    #     ],
+    #     dim=-1,
+    # )
+    raw_heights = []
+    for sensor in sensors:
+        hit_z = sensor.data.ray_hits_w[..., 2].squeeze(-1)
+        valid = ~torch.isnan(hit_z) & ~torch.isinf(hit_z) & (torch.abs(hit_z) < 1e3)
+        hit_z = torch.where(valid, hit_z, torch.zeros_like(hit_z))
+        raw_heights.append(sensor.data.pos_w[:, 2] - hit_z)
+    feet_height = torch.stack(raw_heights, dim=-1)
     return feet_height - foot_radius
 
 
@@ -327,6 +334,7 @@ def feet_air_time_dynamic(
     max_th, min_th = threshold_range
     dynamic_threshold = max_th - cmd_level * (max_th - min_th)  # shape: [num_envs]
 
+    last_air_time = torch.clamp(last_air_time, max=dynamic_threshold.unsqueeze(1) + 0.15)
     # 4. 计算奖励 (当实际滞留时间超过动态阈值时给予正奖励)
     # 扩展维度以支持多足广播 [num_envs, 1]
     reward = torch.sum((last_air_time - dynamic_threshold.unsqueeze(1)) * first_contact, dim=1)
@@ -537,7 +545,13 @@ def base_height_target_exp(
 def sound_suppression_acc_per_foot(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
+    scan_sensor_names: List[str],
+    foot_radius: float,
     command_name: str = "base_velocity",
+    near_ground_height: float = 0.04,  # 近地缓冲层特征高度
+    stand_deadzone: float = 0.1,   # 零速站立死区阈值：低于此值 cmd_decay 为 0
+    full_active_vel: float = 0.20,  # 满额激活阈值：达到此速度时 cmd_decay 升至峰值 1.0
+    decay_scale: float = 2.0,       # 高速衰减特征尺度：高于 full_active_vel 后按指数衰减
 ) -> torch.Tensor:
     asset = env.scene["robot"]
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
@@ -551,9 +565,16 @@ def sound_suppression_acc_per_foot(
     contact_force_z = contact_sensor.data.net_forces_w[:, body_ids, 2]
     in_contact = (torch.abs(contact_force_z) > 20.0).float()
 
+    # 3. 计算足端离地净高并构建【近地缓冲掩码】(Nenv, Nfeet)
+    # 离地越高权重越接近 0（放开高空摆动步频）；进入近地 4~6cm 内权重迅速升至 1.0（引导落地前减速）
+    clearance = torch.clamp(feet_height(env, scan_sensor_names, foot_radius), min=0.0, max=1.0)
+    # 仅在下落阶段 (foot_vel_z < 0) 或已触地时激活近地掩码，不惩罚正常向上抬腿！
+    is_descending_or_contact = ((foot_vel[:, :, 2] < 0.0) | (in_contact > 0.5)).float()
+    near_ground_mask = torch.exp(-clearance / near_ground_height) * is_descending_or_contact
+
     # 3. Z 方向惩罚（砸地）
-    vel_z_penalty = (torch.clamp(foot_vel[:, :, 2], max = 0) ** 2)
-    acc_z_penalty = (foot_acc[:, :, 2] ** 2)
+    vel_z_penalty = (torch.clamp(foot_vel[:, :, 2], max = 0) ** 2) * near_ground_mask
+    acc_z_penalty = (foot_acc[:, :, 2] ** 2) * near_ground_mask
 
     # 4. XY 方向惩罚（打滑与刮擦）
     # 平面速度模长的平方
@@ -574,10 +595,29 @@ def sound_suppression_acc_per_foot(
         0.5 * acc_xy_penalty.sum(dim=1)
     )
 
+    # try:
+    #     commands = env.command_manager.get_command(command_name)
+    #     cmd_vel_mag = torch.norm(commands[:, :2], dim=-1) 
+    #     cmd_decay = torch.exp(-cmd_vel_mag / 1.0) 
+    # except Exception:
+    #     cmd_decay = 1.0
+
+    # 8. 改进的 cmd_decay：零速死区平滑门控 + 线速度/角速度联合高速衰减
     try:
         commands = env.command_manager.get_command(command_name)
-        cmd_vel_mag = torch.norm(commands[:, :2], dim=-1) 
-        cmd_decay = torch.exp(-cmd_vel_mag / 1.0) 
+        lin_vel_mag = torch.norm(commands[:, :2], dim=-1)
+        ang_vel_mag = torch.abs(commands[:, 2]) if commands.shape[-1] >= 3 else torch.zeros_like(lin_vel_mag)
+        # 综合线速度与偏航角速度指令强度（0.5 为等效旋转半径权重）
+        cmd_mag = torch.maximum(lin_vel_mag, 0.5 * ang_vel_mag)
+
+        # (a) 零速死区平滑激活门控：cmd_mag <= 0.08 时为 0.0，cmd_mag >= 0.20 时平滑升至 1.0
+        ramp_alpha = torch.clamp((cmd_mag - stand_deadzone) / (full_active_vel - stand_deadzone + 1e-6), min=0.0, max=1.0)
+        active_gate = ramp_alpha * ramp_alpha * (3.0 - 2.0 * ramp_alpha)
+
+        # (b) 中高速指数衰减：从 full_active_vel (0.20) 开始随速度升高而衰减
+        high_speed_decay = torch.exp(-torch.clamp(cmd_mag - full_active_vel, min=0.0) / decay_scale)
+
+        cmd_decay = active_gate * high_speed_decay
     except Exception:
         cmd_decay = 1.0
 
@@ -962,36 +1002,71 @@ def low_speed(
 #     )
 
 #     return force_variance*0.00001 + air_time_variance + contact_time_variance
-
 def stand_z_force_variance_penalty(
     env: ManagerBasedRLEnv, 
     sensor_cfg: SceneEntityCfg, 
     command_name: str = "base_velocity",  
-    stand_threshold: float = 0.1             
+    stand_threshold: float = 0.1,
+    min_foot_load_ratio: float = 0.15,  # 每只脚至少承担 15% 总垂直载荷（理论均值为 25%）
 ) -> torch.Tensor:
     """
-    仅在站立指令下，直接惩罚四足 Z 轴受力方差。
-    强制机器人四足均匀触地，防止抬起单腿。
+    仅在站立指令下生效：归一化四足 Z 轴受力占比，惩罚单腿悬空或受力过轻。
+    采用承重下限容差（15%）+ 归一化方差，既彻底消除单腿悬空，又兼容斜坡上下坡腿的自然载荷差异。
     """
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     
-    # 获取 4 只脚的 Z 轴受力 [env, 4]
-    force_z = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2]
-    force_z = torch.clamp(force_z, min=0.0) 
+    # 1. 获取 4 只脚的 Z 轴正压力 [env, 4]
+    force_z = torch.clamp(contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2], min=0.0)
+    total_force_z = torch.sum(force_z, dim=-1, keepdim=True)
     
-    # 【核心修改】直接对全部 4 只脚计算方差！
-    # 悬空的脚（受力0）会产生巨大的方差，从而被强烈惩罚
-    absolute_variance = torch.var(force_z, dim=-1)
+    # 2. 归一化为每只脚的承重比例 [0.0 ~ 1.0]，消除质量随机化带来的数值爆炸
+    force_ratio = force_z / (total_force_z + 1e-3)
     
-    # 引入指令判断，仅在站立时生效
+    # 3. 悬空/欠载强惩罚：任何一只脚承重低于 15% (特别是悬空 0%) 时产生显著梯度
+    underload_penalty = torch.sum(torch.square(torch.clamp(min_foot_load_ratio - force_ratio, min=0.0)), dim=-1)
+    # 4. 温和的均布方差项（仅当四足均着地但严重偏载时微调）
+    ratio_variance = torch.var(force_ratio, dim=-1, correction=0)
+    
+    # 若四足总受力接近 0（腾空），直接给满额惩罚 1.0
+    no_support_penalty = (total_force_z.squeeze(-1) < 10.0).float()
+    penalty = 10.0 * underload_penalty + ratio_variance + no_support_penalty
+
+    # 5. 仅在零速度指令（站立状态）下生效，绝不影响爬坡与越障步态
     commands = env.command_manager.get_command(command_name)
-    cmd_norm = torch.linalg.norm(commands, dim=1) #torch.linalg.vector_norm(commands[:, :3], dim=-1)
-    
-    # 速度指令 < 0.1 时，掩码为 1 (站立状态)，否则为 0 (行走状态)
+    cmd_norm = torch.linalg.norm(commands[:, :3], dim=1)
     is_stand_mask = (cmd_norm < stand_threshold).float()
     
-    # 返回最终惩罚
-    return absolute_variance * is_stand_mask
+    return penalty * is_stand_mask
+
+# def stand_z_force_variance_penalty(
+#     env: ManagerBasedRLEnv, 
+#     sensor_cfg: SceneEntityCfg, 
+#     command_name: str = "base_velocity",  
+#     stand_threshold: float = 0.1             
+# ) -> torch.Tensor:
+#     """
+#     仅在站立指令下，直接惩罚四足 Z 轴受力方差。
+#     强制机器人四足均匀触地，防止抬起单腿。
+#     """
+#     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    
+#     # 获取 4 只脚的 Z 轴受力 [env, 4]
+#     force_z = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2]
+#     force_z = torch.clamp(force_z, min=0.0) 
+    
+#     # 【核心修改】直接对全部 4 只脚计算方差！
+#     # 悬空的脚（受力0）会产生巨大的方差，从而被强烈惩罚
+#     absolute_variance = torch.var(force_z, dim=-1)
+    
+#     # 引入指令判断，仅在站立时生效
+#     commands = env.command_manager.get_command(command_name)
+#     cmd_norm = torch.linalg.norm(commands, dim=1) #torch.linalg.vector_norm(commands[:, :3], dim=-1)
+    
+#     # 速度指令 < 0.1 时，掩码为 1 (站立状态)，否则为 0 (行走状态)
+#     is_stand_mask = (cmd_norm < stand_threshold).float()
+    
+#     # 返回最终惩罚
+#     return absolute_variance * is_stand_mask
 
 def base_z_acceleration_penalty(
     env: ManagerBasedRLEnv,  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")

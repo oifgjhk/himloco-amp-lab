@@ -245,4 +245,256 @@ class AMPPPO:
         self.storage.clear()
 
         return mean_value_loss, mean_surrogate_loss, estimation_loss, swap_loss,mean_amp_loss, mean_grad_pen_loss, mean_policy_pred, mean_expert_pred
+    
+    def init_supermimic_world_model(
+        self,
+        state_dim: int,
+        action_dim: int,
+        context_dim: int,
+        cmd_dim: int = 3,
+        wm_lr: float = 2e-4,
+        bptt_horizon: int = 32,
+        wm_window_len: int = 8,
+    ):
+        from himloco_lab.rsl_rl.modules.world_model import DifferentiableWorldModel
+
+        self.bptt_horizon = bptt_horizon
+        self.wm_window_len = wm_window_len
+        self.world_model = DifferentiableWorldModel(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            context_dim=context_dim,
+            cmd_dim=cmd_dim,
+            device=self.device,
+        ).to(self.device)
+
+        wm_params = (
+            list(self.world_model.dynamics_net.parameters())
+            + list(self.world_model.reward_head.parameters())
+            + list(self.world_model.term_head.parameters())
+        )
+        self.wm_optimizer = torch.optim.Adam(wm_params, lr=wm_lr, betas=(0.9, 0.95))
+        self.bptt_actor_optimizer = torch.optim.Adam(
+            self.actor_critic.actor.parameters(), lr=wm_lr, betas=(0.9, 0.95)
+        )
+        self.bptt_critic_optimizer = torch.optim.Adam(
+            self.world_model.wm_critic.parameters(), lr=wm_lr, betas=(0.9, 0.95)
+        )
+
+    def update_world_model(self, wm_buffer, num_batches: int = 10, batch_size: int = 2048) -> dict[str, float]:
+        self.world_model.train()
+        agg_metrics = {"wm_loss_total": 0.0, "wm_loss_state": 0.0, "wm_loss_reward": 0.0, "wm_loss_done": 0.0}
+
+        for _ in range(num_batches):
+            s_seq, a_seq, o_seq, r_seq, d_seq, cmd_seq, xi_seq = wm_buffer.sample_k_step_windows(
+                batch_size=batch_size, k=self.wm_window_len
+            )
+            self.world_model.state_norm.update(s_seq.reshape(-1, s_seq.shape[-1]))
+            self.world_model.context_norm.update(xi_seq.reshape(-1, xi_seq.shape[-1]))
+
+            loss, metrics = self.world_model.compute_k_step_loss(
+                s_seq, a_seq, o_seq, r_seq, d_seq, cmd_seq, xi_seq
+            )
+            self.wm_optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.world_model.parameters(), max_norm=1.0)
+            self.wm_optimizer.step()
+
+            for k_name, v in metrics.items():
+                agg_metrics[k_name] += v / num_batches
+            
+            if getattr(self, "amp_data", None) is not None:
+                # 1. 从刚刚采样的世界模型窗口中提取策略的 AMP 状态转移 (s_t, s_{t+1})
+                policy_s = s_seq[:, 0, 34:].detach()
+                policy_next_s = s_seq[:, 1, 34:].detach()
+
+                # 2. 从专家动作库 AMPLoader 中采样等量的专家状态转移
+                expert_batch_size = policy_s.shape[0]
+                expert_s, expert_next_s = self.amp_data.get_transitions_batch(expert_batch_size) if hasattr(
+                    self.amp_data, "get_transitions_batch"
+                ) else next(self.amp_data.feed_forward_generator(1, expert_batch_size))
+
+                if getattr(self, "amp_normalizer", None) is not None:
+                    self.amp_normalizer.update(policy_s.cpu().numpy())
+                    self.amp_normalizer.update(expert_s.cpu().numpy())
+                    policy_s = self.amp_normalizer.normalize_torch(policy_s, self.device)
+                    policy_next_s = self.amp_normalizer.normalize_torch(policy_next_s, self.device)
+                    expert_s = self.amp_normalizer.normalize_torch(expert_s, self.device)
+                    expert_next_s = self.amp_normalizer.normalize_torch(expert_next_s, self.device)
+
+                expert_d = self.discriminator(torch.cat([expert_s, expert_next_s], dim=-1))
+                policy_d = self.discriminator(torch.cat([policy_s, policy_next_s], dim=-1))
+
+                expert_loss = torch.nn.MSELoss()(expert_d, torch.ones_like(expert_d))
+                policy_loss = torch.nn.MSELoss()(policy_d, -1.0 * torch.ones_like(policy_d))
+                amp_disc_loss = 0.5 * (expert_loss + policy_loss)
+                grad_pen_loss = self.discriminator.compute_grad_pen(expert_s, expert_next_s, lambda_=10.0)
+
+                disc_total_loss = amp_disc_loss + grad_pen_loss
+                # 若判别器参数包含在 self.optimizer 中，仅对 discriminator 部分执行梯度更新
+                self.optimizer.zero_grad()
+                disc_total_loss.backward()
+                nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+        return agg_metrics
+
+    def sample_sensor_noise(self, clean_obs: torch.Tensor) -> torch.Tensor:
+        noise = torch.zeros_like(clean_obs)
+        noise[:, 3:6].uniform_(-0.2 * 0.25, 0.2 * 0.25)
+        noise[:, 6:9].uniform_(-0.05, 0.05)
+        noise[:, 9:21].uniform_(-0.01, 0.01)
+        noise[:, 21:33].uniform_(-1.5 * 0.05, 1.5 * 0.05)
+        return clean_obs + noise
+
+    def update_bptt(self, wm_buffer, batch_size: int = 4096) -> dict[str, float]:
+        import torch.nn.functional as F
+
+        H = self.bptt_horizon
+        for p in self.world_model.parameters():
+            p.requires_grad_(False)
+        for p in self.discriminator.parameters():
+            p.requires_grad_(False)
+
+        s_t, obs_hist_t, cmd, xi = wm_buffer.sample_initial_states(batch_size=batch_size)
+        survival_c = torch.ones(batch_size, device=self.device)
+        discount = 1.0
+
+        imagined_states, imagined_commands, imagined_contexts = [], [], []
+        imagined_rewards, imagined_dones = [], []
+        policy_return = torch.zeros(batch_size, device=self.device)
+
+        for t in range(H):
+            imagined_states.append(s_t)
+            imagined_commands.append(cmd)
+            imagined_contexts.append(xi)
+
+            # 取最新一帧无噪观测注入传感器噪声，并拼回 270 维观测向量 (HIMLoco 默认第 0 帧为最新帧)
+            curr_clean_obs = obs_hist_t[:, 0, :]
+            noisy_obs = self.sample_sensor_noise(curr_clean_obs)
+            curr_obs_hist_flat = torch.cat(
+                [noisy_obs, obs_hist_t[:, 1:, :].reshape(batch_size, -1)], dim=-1
+            )
+
+            # 确保策略前向传播保留计算图梯度
+            actions = self.actor_critic.act_inference(curr_obs_hist_flat)
+            if not actions.requires_grad:
+                clean_dim = curr_clean_obs.shape[-1]
+                if hasattr(self.actor_critic, "estimator"):
+                    vel, latent = self.actor_critic.estimator(curr_obs_hist_flat)
+                    actions = self.actor_critic.actor(
+                        torch.cat([curr_obs_hist_flat[:, :clean_dim], vel, latent], dim=-1)
+                    )
+                else:
+                    actions = self.actor_critic.actor(curr_obs_hist_flat)
+            next_s_t, next_clean_obs, pred_task_rew, _, pred_done_prob = self.world_model.forward_step(
+                s_t, actions, xi, cmd
+            )
+
+            # 后 42 维 (索引 34:) 即为对齐好的 AMP 观测特征
+            amp_s = s_t[:, 34:]
+            amp_next_s = next_s_t[:, 34:]
+            if getattr(self, "amp_normalizer", None) is not None:
+                amp_s_norm = self.amp_normalizer.normalize_torch(amp_s, self.device)
+                amp_next_s_norm = self.amp_normalizer.normalize_torch(amp_next_s, self.device)
+            else:
+                amp_s_norm, amp_next_s_norm = amp_s, amp_next_s
+
+            disc_logits = self.discriminator(torch.cat([amp_s_norm, amp_next_s_norm], dim=-1))
+            amp_rew = torch.clamp(1.0 - 0.25 * torch.square(disc_logits - 1.0), min=0.0).squeeze(-1)
+            is_moving = (torch.norm(cmd[:, :3], dim=-1) >= 0.1).float()
+            amp_rew = amp_rew * is_moving * getattr(self.discriminator, "reward_coef", 0.05)
+
+            lerp = self.discriminator.task_reward_lerp #self.amp_task_reward_lerp
+            step_reward = (1.0 - lerp) * amp_rew + lerp * pred_task_rew
+
+            policy_return = policy_return + discount * survival_c * step_reward
+            imagined_rewards.append(step_reward)
+            imagined_dones.append(pred_done_prob)
+
+            survival_c = survival_c * (1.0 - pred_done_prob)
+            discount *= self.gamma
+            # 循环末尾更新 6 帧历史队列：最新预测帧放在第 0 位，淘汰最老的第 5 帧
+            obs_hist_t = torch.cat([next_clean_obs.unsqueeze(1), obs_hist_t[:, :-1, :]], dim=1)
+            s_t = next_s_t
+
+        # 终端第 H 步价值引导 V_psi(\hat{s}_H, g_H, \xi)
+        terminal_value = self.world_model.evaluate_critic(s_t, cmd, xi).squeeze(-1)
+        policy_return = policy_return + discount * survival_c * terminal_value
+
+        actor_loss = -policy_return.mean()
+        self.bptt_actor_optimizer.zero_grad()
+        actor_loss.backward()
+        nn.utils.clip_grad_norm_(self.actor_critic.actor.parameters(), max_norm=1.0)
+        for p in self.actor_critic.actor.parameters():
+            if p.grad is not None:
+                p.grad.data.clamp_(-0.1, 0.1)
+        self.bptt_actor_optimizer.step()
+
+        for p in self.world_model.parameters():
+            p.requires_grad_(True)
+        for p in self.discriminator.parameters():
+            p.requires_grad_(True)
+
+        critic_loss_val = self._update_critic_on_imagined(
+            imagined_states, imagined_commands, imagined_contexts,
+            imagined_rewards, imagined_dones, terminal_value.detach()
+        )
+
+        return {
+            "bptt_actor_return": (-actor_loss).item(),
+            "bptt_critic_loss": critic_loss_val,
+            "bptt_mean_survival_H": survival_c.mean().item(),
+        }
+
+    def _update_critic_on_imagined(
+        self, states_list, cmds_list, xis_list, rewards_list, dones_list, v_H: torch.Tensor
+    ) -> float:
+        import torch.nn.functional as F
+
+        H = len(rewards_list)
+        B = v_H.shape[0]
+
+        with torch.no_grad():
+            states_stack = torch.stack([s.detach() for s in states_list], dim=0)
+            cmds_stack = torch.stack([c.detach() for c in cmds_list], dim=0)
+            xis_stack = torch.stack([x.detach() for x in xis_list], dim=0)
+            rewards_stack = torch.stack([r.detach() for r in rewards_list], dim=0)
+            dones_stack = torch.stack([d.detach() for d in dones_list], dim=0)
+
+            flat_s = states_stack.reshape(H * B, -1)
+            flat_c = cmds_stack.reshape(H * B, -1)
+            flat_x = xis_stack.reshape(H * B, -1)
+            values = self.world_model.evaluate_critic(flat_s, flat_c, flat_x).reshape(H, B)
+
+            returns = torch.zeros_like(values)
+            R_next = v_H
+            v_next = v_H
+            for t in reversed(range(H)):
+                R_curr = rewards_stack[t] + self.gamma * (1.0 - dones_stack[t]) * (
+                    (1.0 - self.lam) * v_next + self.lam * R_next
+                )
+                returns[t] = R_curr
+                R_next = R_curr
+                v_next = values[t]
+
+            flat_targets = returns.reshape(H * B, 1).detach()
+
+        total_samples = H * B
+        minibatch_size = total_samples // 4
+        total_v_loss = 0.0
+        for _ in range(5):
+            perm = torch.randperm(total_samples, device=self.device)
+            for start in range(0, total_samples, minibatch_size):
+                mb_idx = perm[start : start + minibatch_size]
+                v_pred = self.world_model.evaluate_critic(flat_s[mb_idx], flat_c[mb_idx], flat_x[mb_idx])
+                v_loss = F.mse_loss(v_pred, flat_targets[mb_idx])
+
+                self.bptt_critic_optimizer.zero_grad()
+                v_loss.backward()
+                nn.utils.clip_grad_norm_(self.world_model.wm_critic.parameters(), max_norm=1.0)
+                self.bptt_critic_optimizer.step()
+                total_v_loss += v_loss.item()
+
+        return total_v_loss / (5 * 4)
 

@@ -4,6 +4,8 @@ import torch
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 import numpy as np
+from .utils import is_robot_on_terrain
+from isaaclab.managers import SceneEntityCfg
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 def get_terrain_mapping(env: ManagerBasedRLEnv) -> tuple[list[str], list[str]]:
@@ -276,3 +278,72 @@ def ang_vel_cmd_levels(
             ).tolist()
 
     return torch.tensor(ranges.ang_vel_z[1], device=env.device)
+
+def terrain_levels_vel(
+    env: ManagerBasedRLEnv, env_ids: Sequence[int], asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> dict[str, torch.Tensor] | torch.Tensor:
+    """通用的地形等级课程更新函数：
+    优先使用移动过程中的最大距离 (max_move_distance) 与累积指令矢量 (commands_xy_accumulation) 判断升降级；
+    若底层 CommandTerm 未记录上述属性，则自动回退至 reset 瞬间位移判据。
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    terrain: TerrainImporter = env.scene.terrain
+    terrain_cfg = terrain.cfg.terrain_generator
+    if terrain_cfg is None:
+        return {"mean": torch.zeros((), device=env.device)}
+
+    command_term = env.command_manager.get_term("base_velocity")
+    command = env.command_manager.get_command("base_velocity")
+
+    # 1. 计算有效地形半径 (扣除 sub_terrain_border_width)
+    border = getattr(terrain_cfg, "sub_terrain_border_width", 0.0) or 0.0
+    terrain_length = max(0.0, terrain_cfg.size[0] - 2.0 * border)
+
+    # 2. 获取移动距离：优先使用过程最大距离 max_move_distance，否则回退为瞬间距离
+    if hasattr(command_term, "max_move_distance"):
+        distance = command_term.max_move_distance[env_ids]
+    else:
+        distance = torch.norm(asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1)
+
+    # 升级条件：过程最大距离超过有效地形边长的一半
+    move_up = distance > (terrain_length / 2.0)
+
+    # 3. 计算降级阈值：优先使用 commands_xy_accumulation 矢量和，避免中途反向重采样导致误降级
+    if hasattr(command_term, "commands_xy_accumulation"):
+        cmd_accum = command_term.commands_xy_accumulation[env_ids]
+        # 兼容 resampling_time_range=(min, max) 与标量 resampling_time
+        if hasattr(command_term.cfg, "resampling_time_range"):
+            r_range = command_term.cfg.resampling_time_range
+            resampling_time = 0.5 * (r_range[0] + r_range[1])
+        else:
+            resampling_time = getattr(command_term.cfg, "resampling_time", 10.0)
+
+        zero_prob = getattr(
+            command_term, "zero_command_prob", getattr(command_term.cfg, "rel_standing_envs", 0.0)
+        )
+        target_dist = torch.norm(cmd_accum, dim=1) * (resampling_time * (1.0 - zero_prob))
+    else:
+        cmd_lin_speed = (
+            torch.abs(command[env_ids, 0])
+            if command.shape[-1] == 2
+            else torch.norm(command[env_ids, :2], dim=1)
+        )
+        target_dist = cmd_lin_speed * env.max_episode_length_s
+
+    # 降级条件：过程最大移动距离小于期望净位移的一半，且未满足升级条件
+    move_down = (distance < target_dist * 0.5) & (~move_up)
+
+    # 更新地形等级与环境原点
+    terrain.update_env_origins(env_ids, move_up, move_down)
+
+    # 4. 统计全局平均等级与各子地形平均等级
+    levels = terrain.terrain_levels.float()
+    extras: dict[str, torch.Tensor] = {"mean": torch.mean(levels)}
+    if terrain_cfg.sub_terrains is not None:
+        for terrain_name, sub_cfg in terrain_cfg.sub_terrains.items():
+            if getattr(sub_cfg, "proportion", 0.0) <= 0.0:
+                continue
+            mask = is_robot_on_terrain(env, terrain_name)
+            extras[terrain_name] = torch.mean(levels[mask]) if mask.any() else levels.new_zeros(())
+
+    return extras

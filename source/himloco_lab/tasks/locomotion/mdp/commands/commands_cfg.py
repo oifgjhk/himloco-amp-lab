@@ -32,3 +32,6 @@ class UniformLevelVelocityCommandCfg(UniformVelocityCommandCfg):
     rotation_target_prob: float = MISSING
 
     lateral_target_prob: float = MISSING
+
+    #是否启用基于剩余过关距离的动态速度下界采样
+    dynamic_resample_commands: bool = True

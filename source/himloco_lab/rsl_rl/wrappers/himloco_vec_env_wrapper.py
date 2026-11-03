@@ -351,3 +351,82 @@ class HimlocoVecEnvWrapper(VecEnv):
     def __getattr__(self, name):
         """Forward all other attribute access to wrapped environment."""
         return getattr(self.env, name)
+
+    
+    def get_clean_observations(self) -> torch.Tensor:
+        """
+        提取当前步无噪声的单帧本体观测  (45维)，严格对齐 velocity_env_cfg.py 的 PolicyCfg:
+        [velocity_commands(3), base_ang_vel*0.25(3), projected_gravity(3),
+         joint_pos_rel(12), joint_vel_rel*0.05(12), last_action(12)]
+        """
+        robot = self.unwrapped.scene["robot"]
+        cmd = self.unwrapped.command_manager.get_command("base_velocity")[:, :3]
+        base_ang_vel = robot.data.root_ang_vel_b * 0.25
+        proj_gravity = robot.data.projected_gravity_b
+        dof_pos_rel = robot.data.joint_pos - robot.data.default_joint_pos
+        dof_vel_rel = (robot.data.joint_vel - robot.data.default_joint_vel) * 0.05
+        last_action = self.unwrapped.action_manager.action
+
+        return torch.cat(
+            [cmd, base_ang_vel, proj_gravity, dof_pos_rel, dof_vel_rel, last_action], dim=-1
+        ).to(device=self.device, dtype=torch.float32)
+
+    def get_obs_history_3d(self) -> torch.Tensor:
+        """
+        获取 3D 历史观测张量 [num_envs, history_length, single_obs_dim] (例如 [4096, 5, 45])。
+        直接从当前环境的 obs_buf 重塑；若无 obs_buf 则用当前无噪观测填充。
+        """
+        clean_obs = self.get_clean_observations()
+        single_obs_dim = clean_obs.shape[-1]
+        hist_len = self.num_obs // single_obs_dim
+
+        # 优先从 wrapper 已维护的 obs_buf (shape: [num_envs, hist_len * 45]) 提取
+        if hasattr(self, "obs_buf") and self.obs_buf is not None and self.obs_buf.shape[-1] == self.num_obs:
+            return self.obs_buf.view(self.num_envs, hist_len, single_obs_dim).clone()
+
+        # 若使用自我维护的队列，则动态更新
+        if not hasattr(self, "_wm_obs_hist_3d") or self._wm_obs_hist_3d.shape[0] != self.num_envs:
+            self._wm_obs_hist_3d = clean_obs.unsqueeze(1).repeat(1, hist_len, 1).clone()
+        else:
+            self._wm_obs_hist_3d = torch.cat([self._wm_obs_hist_3d[:, 1:, :], clean_obs.unsqueeze(1)], dim=1)
+        return self._wm_obs_hist_3d.clone()
+
+    def get_wm_state(self) -> torch.Tensor:
+        """
+        提取世界模型状态 s_t (共 34 + amp_obs_dim 维):
+        - 前 34 维 (IsaacLab 关节顺序，用于解析重构 Policy 观测):
+          [root_z(1), base_lin_vel_b(3), base_ang_vel_b(3), projected_gravity_b(3), dof_pos_rel(12), dof_vel_rel(12)]
+        - 后 42 维 (AMP 关节/足端顺序，直接输入 AMPDiscriminator 计算可微风格奖励)
+        """
+        robot = self.unwrapped.scene["robot"]
+        root_z = robot.data.root_pos_w[:, 2:3]
+        base_lin_vel = robot.data.root_lin_vel_b
+        base_ang_vel = robot.data.root_ang_vel_b
+        proj_gravity = robot.data.projected_gravity_b
+        dof_pos_rel = robot.data.joint_pos - robot.data.default_joint_pos
+        dof_vel_rel = robot.data.joint_vel - robot.data.default_joint_vel
+        amp_obs = self.get_amp_observations()
+
+        return torch.cat(
+            [root_z, base_lin_vel, base_ang_vel, proj_gravity, dof_pos_rel, dof_vel_rel, amp_obs], dim=-1
+        ).to(device=self.device, dtype=torch.float32)
+
+    def get_sim_context(self) -> torch.Tensor:
+        """提取域随机化上下文 (机身质心偏移 3 维 + 机身质量 1 维 = 4 维)，常驻 GPU 缓存"""
+        robot = self.unwrapped.scene["robot"]
+        num_envs = self.num_envs
+
+        if not hasattr(self, "_cached_static_context") or self._cached_static_context is None:
+            try:
+                coms = robot.root_physx_view.get_coms()[:, 0, :3].to(device=self.device, dtype=torch.float32)
+            except Exception:
+                coms = torch.zeros(num_envs, 3, device=self.device, dtype=torch.float32)
+
+            try:
+                masses = robot.root_physx_view.get_masses()[:, 0:1].to(device=self.device, dtype=torch.float32)
+            except Exception:
+                masses = torch.ones(num_envs, 1, device=self.device, dtype=torch.float32)
+
+            self._cached_static_context = torch.cat([coms, masses], dim=-1)
+
+        return self._cached_static_context
