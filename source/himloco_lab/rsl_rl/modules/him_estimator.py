@@ -153,3 +153,10 @@ def get_activation(act_name):
     else:
         print("invalid activation function!")
         return None
+
+def forward_with_grad(self, obs_history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """用于 BPTT 想象滚动：保留 (vel, z) 对输入 obs_history 的计算图梯度"""
+        parts = self.encoder(obs_history)
+        vel, z = parts[..., :3], parts[..., 3:]
+        z = F.normalize(z, dim=-1, p=2)
+        return vel, z

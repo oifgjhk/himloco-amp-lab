@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 
 class RunningMeanStd(nn.Module):
-    """纯 PyTorch GPU 在线均值方差归一化器，支持可微前向传播"""
+    """纯 PyTorch GPU 在线均值方差归一化器"""
 
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -38,7 +38,7 @@ class RunningMeanStd(nn.Module):
 
 
 class DifferentiableWorldModel(nn.Module):
-    """SuperMimic 可微世界模型 (Section 3.2 & Table A.4)"""
+    """SuperMimic 可微世界模型 (Section 3.2 & Table A.4 / Table A.6)"""
 
     def __init__(
         self,
@@ -61,37 +61,46 @@ class DifferentiableWorldModel(nn.Module):
         self.state_norm = RunningMeanStd(state_dim).to(device)
         self.context_norm = RunningMeanStd(context_dim).to(device)
 
-        # 1. 动力学网络 f_omega(s_t, a_t, xi) -> delta_s (MLP: 2048 x 3, Table A.4)
+        # 1. 核心动力学网络 f_omega(s_t, a_t, xi) -> delta_s (MLP: 2048 x 3)
         dyn_in_dim = state_dim + action_dim + context_dim
         layers = []
         in_d = dyn_in_dim
         for h_d in hidden_dims:
             layers.extend([nn.Linear(in_d, h_d), nn.LayerNorm(h_d), nn.SiLU()])
             in_d = h_d
-        layers.append(nn.Linear(in_d, state_dim))
+        final_dyn = nn.Linear(in_d, state_dim)
+        nn.init.uniform_(final_dyn.weight, -1e-3, 1e-3)
+        nn.init.zeros_(final_dyn.bias)
+        layers.append(final_dyn)
         self.dynamics_net = nn.Sequential(*layers)
 
-        # 2. 任务奖励头 r_omega(s_t, a_t, g_t)
-        rew_in_dim = state_dim + action_dim + cmd_dim
+        # 2. 残差任务奖励头 r_omega_res(s_{t+1}, a_t, a_{t-1}, g_t)
+        rew_in_dim = state_dim + action_dim * 2 + cmd_dim
+        final_rew = nn.Linear(256, 1)
+        nn.init.uniform_(final_rew.weight, -1e-3, 1e-3)
+        nn.init.zeros_(final_rew.bias)
         self.reward_head = nn.Sequential(
             nn.Linear(rew_in_dim, 512),
             nn.LayerNorm(512),
             nn.SiLU(),
             nn.Linear(512, 256),
             nn.SiLU(),
-            nn.Linear(256, 1),
+            final_rew,
         )
 
-        # 3. 软终止头 d_omega(s_t, g_t)
+        # 3. 软终止头 d_omega(s_{t+1}, g_t) (偏置初始化为 -4.0，使初始死亡率约为 0.018 而非 0.5)
+        final_term = nn.Linear(128, 1)
+        nn.init.uniform_(final_term.weight, -1e-2, 1e-2)
+        nn.init.constant_(final_term.bias, -4.0)
         self.term_head = nn.Sequential(
             nn.Linear(state_dim + cmd_dim, 256),
             nn.SiLU(),
             nn.Linear(256, 128),
             nn.SiLU(),
-            nn.Linear(128, 1),
+            final_term,
         )
 
-        # 4. 想象滚动专用 Critic V_psi(s_t, g_t, xi) (对照论文 Table A.4: MLP 256, 128)
+        # 4. 想象滚动专用 Critic V_psi(s_t, g_t, xi) (Table A.4: MLP 256, 128)
         self.wm_critic = nn.Sequential(
             nn.Linear(state_dim + cmd_dim + context_dim, 256),
             nn.LayerNorm(256),
@@ -105,10 +114,40 @@ class DifferentiableWorldModel(nn.Module):
         critic_in = torch.cat([self.state_norm(state), cmd, self.context_norm(context)], dim=-1)
         return self.wm_critic(critic_in)
 
+    def compute_analytic_task_reward(
+        self,
+        next_state: torch.Tensor,
+        action: torch.Tensor,
+        prev_action: torch.Tensor,
+        command: torch.Tensor,
+    ) -> torch.Tensor:
+        """解析主任务奖励（提供精确的速度跟踪、水平姿态与动作平滑一阶梯度）"""
+        lin_vel_b = next_state[:, 1:4]
+        ang_vel_b = next_state[:, 4:7]
+        proj_grav = next_state[:, 7:10]
+
+        lin_vel_err = torch.sum(torch.square(command[:, :2] - lin_vel_b[:, :2]), dim=-1)
+        rew_lin_vel = 2.5 * torch.exp(-lin_vel_err / 0.1)
+
+        ang_vel_err = torch.square(command[:, 2] - ang_vel_b[:, 2])
+        rew_ang_vel = 1.5 * torch.exp(-ang_vel_err / 0.1)
+
+        pen_lin_z = -2.0 * torch.square(lin_vel_b[:, 2])
+        pen_ang_xy = -0.25 * torch.sum(torch.square(ang_vel_b[:, :2]), dim=-1)
+        pen_flat = -1.5 * torch.sum(torch.square(proj_grav[:, :2]), dim=-1)
+        pen_action_rate = -0.03 * torch.sum(torch.square(action - prev_action), dim=-1)
+        pen_action_l2 = -0.002 * torch.sum(torch.square(action), dim=-1)
+
+        analytic_rew = (
+            rew_lin_vel + rew_ang_vel + pen_lin_z + pen_ang_xy + pen_flat + pen_action_rate + pen_action_l2
+        ) * self.dt
+        return analytic_rew
+
     def forward_step(
         self,
         state: torch.Tensor,
         action: torch.Tensor,
+        prev_action: torch.Tensor,
         context: torch.Tensor,
         command: torch.Tensor,
     ):
@@ -130,7 +169,7 @@ class DifferentiableWorldModel(nn.Module):
             dim=-1,
         )
 
-        # 解析观测头：从 next_state 前 34 维重构 45 维无噪观测 \hat{\bar{o}}_{t+1}
+        # 解析观测头 g_omega(\hat{s}_{t+1}): 重构 45 维无噪观测 \hat{\bar{o}}_{t+1}
         base_ang_vel = next_state[:, 4:7] * 0.25
         proj_gravity = next_state[:, 7:10]
         dof_pos_rel = next_state[:, 10:22]
@@ -139,8 +178,10 @@ class DifferentiableWorldModel(nn.Module):
             [command, base_ang_vel, proj_gravity, dof_pos_rel, dof_vel_rel, action], dim=-1
         )
 
-        rew_in = torch.cat([self.state_norm(next_state), action, command], dim=-1)
-        pred_reward = self.reward_head(rew_in).squeeze(-1)
+        analytic_rew = self.compute_analytic_task_reward(next_state, action, prev_action, command)
+        rew_in = torch.cat([self.state_norm(next_state), action, prev_action, command], dim=-1)
+        res_rew = self.reward_head(rew_in).squeeze(-1)
+        pred_reward = analytic_rew + res_rew
 
         term_in = torch.cat([self.state_norm(next_state), command], dim=-1)
         pred_done_logits = self.term_head(term_in).squeeze(-1)
@@ -154,22 +195,42 @@ class DifferentiableWorldModel(nn.Module):
         actions_seq: torch.Tensor,
         clean_obs_seq: torch.Tensor,
         rewards_seq: torch.Tensor,
-        dones_seq: torch.Tensor,
+        falls_seq: torch.Tensor,
+        resets_seq: torch.Tensor,
         commands_seq: torch.Tensor,
         context_seq: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         k = actions_seq.shape[1]
         pred_s = states_seq[:, 0, :]
+        prev_act = clean_obs_seq[:, 0, 33:45]
 
         loss_s, loss_o, loss_r, loss_d = 0.0, 0.0, 0.0, 0.0
+        valid_step_mask = torch.ones(states_seq.shape[0], device=self.device)
+
         for j in range(k):
+            curr_act = actions_seq[:, j, :]
             pred_s, pred_o, pred_r, pred_d_logits, _ = self.forward_step(
-                pred_s, actions_seq[:, j, :], context_seq[:, j, :], commands_seq[:, j, :]
+                pred_s, curr_act, prev_act, context_seq[:, j, :], commands_seq[:, j, :]
             )
-            loss_s = loss_s + F.mse_loss(pred_s, states_seq[:, j + 1, :])
-            loss_o = loss_o + F.mse_loss(pred_o, clean_obs_seq[:, j + 1, :])
-            loss_r = loss_r + F.mse_loss(pred_r, rewards_seq[:, j])
-            loss_d = loss_d + F.binary_cross_entropy_with_logits(pred_d_logits, dones_seq[:, j].float())
+            prev_act = curr_act
+
+            loss_d_step = F.binary_cross_entropy_with_logits(
+                pred_d_logits, falls_seq[:, j].float(), reduction="none"
+            )
+            loss_d = loss_d + (loss_d_step * valid_step_mask).mean()
+
+            not_reset_j = (1.0 - resets_seq[:, j].float()) * valid_step_mask
+            valid_count = torch.clamp(not_reset_j.sum(), min=1.0)
+
+            step_mse_s = torch.mean(torch.square(pred_s - states_seq[:, j + 1, :]), dim=-1)
+            step_mse_o = torch.mean(torch.square(pred_o - clean_obs_seq[:, j + 1, :]), dim=-1)
+            step_mse_r = torch.square(pred_r - rewards_seq[:, j])
+
+            loss_s = loss_s + (step_mse_s * not_reset_j).sum() / valid_count
+            loss_o = loss_o + (step_mse_o * not_reset_j).sum() / valid_count
+            loss_r = loss_r + (step_mse_r * not_reset_j).sum() / valid_count
+
+            valid_step_mask = not_reset_j
 
         total_loss = (loss_s + loss_o + loss_r + loss_d) / k
         return total_loss, {

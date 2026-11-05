@@ -251,6 +251,7 @@ class AMPPPO:
         state_dim: int,
         action_dim: int,
         context_dim: int,
+        wm_state_to_amp_obs_fn,
         cmd_dim: int = 3,
         wm_lr: float = 2e-4,
         bptt_horizon: int = 32,
@@ -260,6 +261,8 @@ class AMPPPO:
 
         self.bptt_horizon = bptt_horizon
         self.wm_window_len = wm_window_len
+        self.wm_state_to_amp_obs_fn = wm_state_to_amp_obs_fn
+
         self.world_model = DifferentiableWorldModel(
             state_dim=state_dim,
             action_dim=action_dim,
@@ -280,20 +283,34 @@ class AMPPPO:
         self.bptt_critic_optimizer = torch.optim.Adam(
             self.world_model.wm_critic.parameters(), lr=wm_lr, betas=(0.9, 0.95)
         )
+        # 独立的判别器优化器，避免触碰 self.optimizer 中的 actor_critic 动量
+        self.bptt_disc_optimizer = torch.optim.Adam(
+            self.discriminator.parameters(), lr=wm_lr, betas=(0.9, 0.95)
+        )
 
     def update_world_model(self, wm_buffer, num_batches: int = 10, batch_size: int = 2048) -> dict[str, float]:
         self.world_model.train()
-        agg_metrics = {"wm_loss_total": 0.0, "wm_loss_state": 0.0, "wm_loss_reward": 0.0, "wm_loss_done": 0.0}
+        agg_metrics = {
+            "wm_loss_total": 0.0,
+            "wm_loss_state": 0.0,
+            "wm_loss_reward": 0.0,
+            "wm_loss_done": 0.0,
+            "amp_disc_loss": 0.0,
+            "amp_grad_pen": 0.0,
+        }
+
+        expert_gen = self.amp_data.feed_forward_generator(num_batches, batch_size)
 
         for _ in range(num_batches):
-            s_seq, a_seq, o_seq, r_seq, d_seq, cmd_seq, xi_seq = wm_buffer.sample_k_step_windows(
-                batch_size=batch_size, k=self.wm_window_len
-            )
+            (
+                s_seq, a_seq, o_seq, r_seq, falls_seq, resets_seq, cmd_seq, xi_seq
+            ) = wm_buffer.sample_k_step_windows(batch_size=batch_size, k=self.wm_window_len)
+
             self.world_model.state_norm.update(s_seq.reshape(-1, s_seq.shape[-1]))
             self.world_model.context_norm.update(xi_seq.reshape(-1, xi_seq.shape[-1]))
 
             loss, metrics = self.world_model.compute_k_step_loss(
-                s_seq, a_seq, o_seq, r_seq, d_seq, cmd_seq, xi_seq
+                s_seq, a_seq, o_seq, r_seq, falls_seq, resets_seq, cmd_seq, xi_seq
             )
             self.wm_optimizer.zero_grad()
             loss.backward()
@@ -302,19 +319,18 @@ class AMPPPO:
 
             for k_name, v in metrics.items():
                 agg_metrics[k_name] += v / num_batches
-            
-            if getattr(self, "amp_data", None) is not None:
-                # 1. 从刚刚采样的世界模型窗口中提取策略的 AMP 状态转移 (s_t, s_{t+1})
-                policy_s = s_seq[:, 0, 34:].detach()
-                policy_next_s = s_seq[:, 1, 34:].detach()
 
-                # 2. 从专家动作库 AMPLoader 中采样等量的专家状态转移
-                expert_batch_size = policy_s.shape[0]
-                expert_s, expert_next_s = self.amp_data.get_transitions_batch(expert_batch_size) if hasattr(
-                    self.amp_data, "get_transitions_batch"
-                ) else next(self.amp_data.feed_forward_generator(1, expert_batch_size))
+            # 同步更新 AMP 判别器 (仅使用未发生 Reset 的真实状态转移对)
+            valid_trans = ~resets_seq[:, 0]
+            if valid_trans.any() and self.amp_data is not None:
+                policy_s = self.wm_state_to_amp_obs_fn(s_seq[valid_trans, 0, :]).detach()
+                policy_next_s = self.wm_state_to_amp_obs_fn(s_seq[valid_trans, 1, :]).detach()
+                expert_s, expert_next_s = next(expert_gen)
+                n_min = min(policy_s.shape[0], expert_s.shape[0])
+                policy_s, policy_next_s = policy_s[:n_min], policy_next_s[:n_min]
+                expert_s, expert_next_s = expert_s[:n_min], expert_next_s[:n_min]
 
-                if getattr(self, "amp_normalizer", None) is not None:
+                if self.amp_normalizer is not None:
                     self.amp_normalizer.update(policy_s.cpu().numpy())
                     self.amp_normalizer.update(expert_s.cpu().numpy())
                     policy_s = self.amp_normalizer.normalize_torch(policy_s, self.device)
@@ -327,36 +343,43 @@ class AMPPPO:
 
                 expert_loss = torch.nn.MSELoss()(expert_d, torch.ones_like(expert_d))
                 policy_loss = torch.nn.MSELoss()(policy_d, -1.0 * torch.ones_like(policy_d))
-                amp_disc_loss = 0.5 * (expert_loss + policy_loss)
-                grad_pen_loss = self.discriminator.compute_grad_pen(expert_s, expert_next_s, lambda_=10.0)
+                amp_loss = 0.5 * (expert_loss + policy_loss)
+                grad_pen = self.discriminator.compute_grad_pen(expert_s, expert_next_s, lambda_=10.0)
 
-                disc_total_loss = amp_disc_loss + grad_pen_loss
-                # 若判别器参数包含在 self.optimizer 中，仅对 discriminator 部分执行梯度更新
-                self.optimizer.zero_grad()
-                disc_total_loss.backward()
+                self.bptt_disc_optimizer.zero_grad()
+                (amp_loss + grad_pen).backward()
                 nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
-                self.optimizer.step()
+                self.bptt_disc_optimizer.step()
+
+                agg_metrics["amp_disc_loss"] += amp_loss.item() / num_batches
+                agg_metrics["amp_grad_pen"] += grad_pen.item() / num_batches
 
         return agg_metrics
 
     def sample_sensor_noise(self, clean_obs: torch.Tensor) -> torch.Tensor:
         noise = torch.zeros_like(clean_obs)
-        noise[:, 3:6].uniform_(-0.2 * 0.25, 0.2 * 0.25)
-        noise[:, 6:9].uniform_(-0.05, 0.05)
-        noise[:, 9:21].uniform_(-0.01, 0.01)
-        noise[:, 21:33].uniform_(-1.5 * 0.05, 1.5 * 0.05)
+        noise[..., 3:6].uniform_(-0.2 * 0.25, 0.2 * 0.25)
+        noise[..., 6:9].uniform_(-0.05, 0.05)
+        noise[..., 9:21].uniform_(-0.01, 0.01)
+        noise[..., 21:33].uniform_(-1.5 * 0.05, 1.5 * 0.05)
         return clean_obs + noise
 
     def update_bptt(self, wm_buffer, batch_size: int = 4096) -> dict[str, float]:
-        import torch.nn.functional as F
-
         H = self.bptt_horizon
+        # 冻结世界模型、AMP判别器与 HIMEstimator 的权重，但允许梯度流经其输入张量
         for p in self.world_model.parameters():
             p.requires_grad_(False)
         for p in self.discriminator.parameters():
             p.requires_grad_(False)
+        if hasattr(self.actor_critic, "estimator"):
+            for p in self.actor_critic.estimator.parameters():
+                p.requires_grad_(False)
 
-        s_t, obs_hist_t, cmd, xi = wm_buffer.sample_initial_states(batch_size=batch_size)
+        # s_t: [B, 46], clean_obs_hist_t: [B, 6, 45] (索引 0 为最新帧 o_t，索引 5 为最老帧 o_{t-5})
+        s_t, clean_obs_hist_t, cmd, xi = wm_buffer.sample_initial_states(batch_size=batch_size)
+        # 对初始 6 帧无噪历史观测注入一次传感器噪声
+        noisy_obs_hist_t = self.sample_sensor_noise(clean_obs_hist_t)
+
         survival_c = torch.ones(batch_size, device=self.device)
         discount = 1.0
 
@@ -364,37 +387,40 @@ class AMPPPO:
         imagined_rewards, imagined_dones = [], []
         policy_return = torch.zeros(batch_size, device=self.device)
 
+        lerp = getattr(self.discriminator, "task_reward_lerp", 0.7)
+        reward_coef = getattr(self.discriminator, "reward_coef", 0.05)
+
         for t in range(H):
             imagined_states.append(s_t)
             imagined_commands.append(cmd)
             imagined_contexts.append(xi)
 
-            # 取最新一帧无噪观测注入传感器噪声，并拼回 270 维观测向量 (HIMLoco 默认第 0 帧为最新帧)
-            curr_clean_obs = obs_hist_t[:, 0, :]
-            noisy_obs = self.sample_sensor_noise(curr_clean_obs)
-            curr_obs_hist_flat = torch.cat(
-                [noisy_obs, obs_hist_t[:, 1:, :].reshape(batch_size, -1)], dim=-1
-            )
+            # 展平为 [B, 270]，此时 [:, :45] 严格对应最新帧 noisy_obs_t
+            curr_obs_hist_flat = noisy_obs_hist_t.reshape(batch_size, -1)
+            prev_action = noisy_obs_hist_t[:, 0, 33:45]
 
-            # 确保策略前向传播保留计算图梯度
-            actions = self.actor_critic.act_inference(curr_obs_hist_flat)
-            if not actions.requires_grad:
-                clean_dim = curr_clean_obs.shape[-1]
-                if hasattr(self.actor_critic, "estimator"):
-                    vel, latent = self.actor_critic.estimator(curr_obs_hist_flat)
-                    actions = self.actor_critic.actor(
-                        torch.cat([curr_obs_hist_flat[:, :clean_dim], vel, latent], dim=-1)
-                    )
-                else:
-                    actions = self.actor_critic.actor(curr_obs_hist_flat)
+            # 通过 forward_with_grad 保留估计器速度 vel 与隐状态 z 对历史观测的雅可比梯度
+            if hasattr(self.actor_critic, "estimator") and hasattr(
+                self.actor_critic.estimator, "forward_with_grad"
+            ):
+                vel, latent = self.actor_critic.estimator.forward_with_grad(curr_obs_hist_flat)
+                raw_actions = self.actor_critic.actor(
+                    torch.cat([curr_obs_hist_flat[:, :45], vel, latent], dim=-1)
+                )
+            else:
+                raw_actions = self.actor_critic.act_inference(curr_obs_hist_flat)
+
+            # 软限幅在 [-10, 10] 内，防止 BPTT 梯度将动作推向世界模型分布外 (OOD)
+            actions = 10.0 * torch.tanh(raw_actions / 10.0)
+
             next_s_t, next_clean_obs, pred_task_rew, _, pred_done_prob = self.world_model.forward_step(
-                s_t, actions, xi, cmd
+                s_t, actions, prev_action, xi, cmd
             )
 
-            # 后 42 维 (索引 34:) 即为对齐好的 AMP 观测特征
-            amp_s = s_t[:, 34:]
-            amp_next_s = next_s_t[:, 34:]
-            if getattr(self, "amp_normalizer", None) is not None:
+            # 从 46 维状态解析映射出 43 维 AMP 观测，计算可微风格奖励
+            amp_s = self.wm_state_to_amp_obs_fn(s_t)
+            amp_next_s = self.wm_state_to_amp_obs_fn(next_s_t)
+            if self.amp_normalizer is not None:
                 amp_s_norm = self.amp_normalizer.normalize_torch(amp_s, self.device)
                 amp_next_s_norm = self.amp_normalizer.normalize_torch(amp_next_s, self.device)
             else:
@@ -403,22 +429,25 @@ class AMPPPO:
             disc_logits = self.discriminator(torch.cat([amp_s_norm, amp_next_s_norm], dim=-1))
             amp_rew = torch.clamp(1.0 - 0.25 * torch.square(disc_logits - 1.0), min=0.0).squeeze(-1)
             is_moving = (torch.norm(cmd[:, :3], dim=-1) >= 0.1).float()
-            amp_rew = amp_rew * is_moving * getattr(self.discriminator, "reward_coef", 0.05)
+            amp_rew = amp_rew * is_moving * reward_coef
 
-            lerp = self.discriminator.task_reward_lerp #self.amp_task_reward_lerp
             step_reward = (1.0 - lerp) * amp_rew + lerp * pred_task_rew
-
             policy_return = policy_return + discount * survival_c * step_reward
+
             imagined_rewards.append(step_reward)
             imagined_dones.append(pred_done_prob)
 
             survival_c = survival_c * (1.0 - pred_done_prob)
             discount *= self.gamma
-            # 循环末尾更新 6 帧历史队列：最新预测帧放在第 0 位，淘汰最老的第 5 帧
-            obs_hist_t = torch.cat([next_clean_obs.unsqueeze(1), obs_hist_t[:, :-1, :]], dim=1)
+
+            # 向新预测的无噪观测注入传感器噪声，并插入第 0 位（淘汰最老的第 5 帧）
+            noisy_next_obs = self.sample_sensor_noise(next_clean_obs)
+            noisy_obs_hist_t = torch.cat(
+                [noisy_next_obs.unsqueeze(1), noisy_obs_hist_t[:, :-1, :]], dim=1
+            )
             s_t = next_s_t
 
-        # 终端第 H 步价值引导 V_psi(\hat{s}_H, g_H, \xi)
+        # 终端第 H 步 Critic 引导价值 (Eq. 2)
         terminal_value = self.world_model.evaluate_critic(s_t, cmd, xi).squeeze(-1)
         policy_return = policy_return + discount * survival_c * terminal_value
 
@@ -431,10 +460,14 @@ class AMPPPO:
                 p.grad.data.clamp_(-0.1, 0.1)
         self.bptt_actor_optimizer.step()
 
+        # 恢复所有网络参数的 requires_grad 标志
         for p in self.world_model.parameters():
             p.requires_grad_(True)
         for p in self.discriminator.parameters():
             p.requires_grad_(True)
+        if hasattr(self.actor_critic, "estimator"):
+            for p in self.actor_critic.estimator.parameters():
+                p.requires_grad_(True)
 
         critic_loss_val = self._update_critic_on_imagined(
             imagined_states, imagined_commands, imagined_contexts,
