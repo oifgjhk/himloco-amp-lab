@@ -307,6 +307,9 @@ class AMPPPO:
             ) = wm_buffer.sample_k_step_windows(batch_size=batch_size, k=self.wm_window_len)
 
             self.world_model.state_norm.update(s_seq.reshape(-1, s_seq.shape[-1]))
+            valid_deltas = (s_seq[:, 1:, :] - s_seq[:, :-1, :])[~resets_seq]
+            if valid_deltas.numel() > 0:
+                self.world_model.delta_norm.update(valid_deltas.reshape(-1, s_seq.shape[-1]))
             self.world_model.context_norm.update(xi_seq.reshape(-1, xi_seq.shape[-1]))
 
             loss, metrics = self.world_model.compute_k_step_loss(
@@ -320,7 +323,6 @@ class AMPPPO:
             for k_name, v in metrics.items():
                 agg_metrics[k_name] += v / num_batches
 
-            # 同步更新 AMP 判别器 (仅使用未发生 Reset 的真实状态转移对)
             valid_trans = ~resets_seq[:, 0]
             if valid_trans.any() and self.amp_data is not None:
                 policy_s = self.wm_state_to_amp_obs_fn(s_seq[valid_trans, 0, :]).detach()
@@ -357,6 +359,7 @@ class AMPPPO:
         return agg_metrics
 
     def sample_sensor_noise(self, clean_obs: torch.Tensor) -> torch.Tensor:
+        """严格对齐 ecow PolicyCfg 的噪声与缩放系数 (ang_vel scale=0.25, joint_vel scale=0.05)"""
         noise = torch.zeros_like(clean_obs)
         noise[..., 3:6].uniform_(-0.2 * 0.25, 0.2 * 0.25)
         noise[..., 6:9].uniform_(-0.05, 0.05)
@@ -366,7 +369,6 @@ class AMPPPO:
 
     def update_bptt(self, wm_buffer, batch_size: int = 4096) -> dict[str, float]:
         H = self.bptt_horizon
-        # 冻结世界模型、AMP判别器与 HIMEstimator 的权重，但允许梯度流经其输入张量
         for p in self.world_model.parameters():
             p.requires_grad_(False)
         for p in self.discriminator.parameters():
@@ -375,9 +377,7 @@ class AMPPPO:
             for p in self.actor_critic.estimator.parameters():
                 p.requires_grad_(False)
 
-        # s_t: [B, 46], clean_obs_hist_t: [B, 6, 45] (索引 0 为最新帧 o_t，索引 5 为最老帧 o_{t-5})
         s_t, clean_obs_hist_t, cmd, xi = wm_buffer.sample_initial_states(batch_size=batch_size)
-        # 对初始 6 帧无噪历史观测注入一次传感器噪声
         noisy_obs_hist_t = self.sample_sensor_noise(clean_obs_hist_t)
 
         survival_c = torch.ones(batch_size, device=self.device)
@@ -395,11 +395,9 @@ class AMPPPO:
             imagined_commands.append(cmd)
             imagined_contexts.append(xi)
 
-            # 展平为 [B, 270]，此时 [:, :45] 严格对应最新帧 noisy_obs_t
             curr_obs_hist_flat = noisy_obs_hist_t.reshape(batch_size, -1)
             prev_action = noisy_obs_hist_t[:, 0, 33:45]
 
-            # 通过 forward_with_grad 保留估计器速度 vel 与隐状态 z 对历史观测的雅可比梯度
             if hasattr(self.actor_critic, "estimator") and hasattr(
                 self.actor_critic.estimator, "forward_with_grad"
             ):
@@ -410,14 +408,13 @@ class AMPPPO:
             else:
                 raw_actions = self.actor_critic.act_inference(curr_obs_hist_flat)
 
-            # 软限幅在 [-10, 10] 内，防止 BPTT 梯度将动作推向世界模型分布外 (OOD)
             actions = 10.0 * torch.tanh(raw_actions / 10.0)
 
             next_s_t, next_clean_obs, pred_task_rew, _, pred_done_prob = self.world_model.forward_step(
                 s_t, actions, prev_action, xi, cmd
             )
 
-            # 从 46 维状态解析映射出 43 维 AMP 观测，计算可微风格奖励
+            # 从 46 维统一状态可微重构 42 维 AMP 状态
             amp_s = self.wm_state_to_amp_obs_fn(s_t)
             amp_next_s = self.wm_state_to_amp_obs_fn(next_s_t)
             if self.amp_normalizer is not None:
@@ -427,7 +424,9 @@ class AMPPPO:
                 amp_s_norm, amp_next_s_norm = amp_s, amp_next_s
 
             disc_logits = self.discriminator(torch.cat([amp_s_norm, amp_next_s_norm], dim=-1))
-            amp_rew = torch.clamp(1.0 - 0.25 * torch.square(disc_logits - 1.0), min=0.0).squeeze(-1)
+            # Leaky-LSGAN：消除 disc_logits <= -1.0 时的 clamp(min=0) 梯度死区，持续提供迈步风格梯度！
+            raw_amp_rew = 1.0 - 0.25 * torch.square(disc_logits - 1.0)
+            amp_rew = torch.where(raw_amp_rew >= 0.0, raw_amp_rew, 0.25 * raw_amp_rew).squeeze(-1)
             is_moving = (torch.norm(cmd[:, :3], dim=-1) >= 0.1).float()
             amp_rew = amp_rew * is_moving * reward_coef
 
@@ -440,14 +439,12 @@ class AMPPPO:
             survival_c = survival_c * (1.0 - pred_done_prob)
             discount *= self.gamma
 
-            # 向新预测的无噪观测注入传感器噪声，并插入第 0 位（淘汰最老的第 5 帧）
             noisy_next_obs = self.sample_sensor_noise(next_clean_obs)
             noisy_obs_hist_t = torch.cat(
                 [noisy_next_obs.unsqueeze(1), noisy_obs_hist_t[:, :-1, :]], dim=1
             )
             s_t = next_s_t
 
-        # 终端第 H 步 Critic 引导价值 (Eq. 2)
         terminal_value = self.world_model.evaluate_critic(s_t, cmd, xi).squeeze(-1)
         policy_return = policy_return + discount * survival_c * terminal_value
 
@@ -460,7 +457,6 @@ class AMPPPO:
                 p.grad.data.clamp_(-0.1, 0.1)
         self.bptt_actor_optimizer.step()
 
-        # 恢复所有网络参数的 requires_grad 标志
         for p in self.world_model.parameters():
             p.requires_grad_(True)
         for p in self.discriminator.parameters():

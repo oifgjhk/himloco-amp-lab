@@ -354,7 +354,11 @@ class HimlocoVecEnvWrapper(VecEnv):
 
     
     def get_clean_observations(self) -> torch.Tensor:
-        """提取当前步无噪声单帧本体观测 \bar{o}_t (45维)"""
+        """
+        提取当前步无噪声单帧本体观测 \bar{o}_t (45维)，严格对齐 ecow PolicyCfg 的缩放系数 (0.25 与 0.05):
+        [velocity_commands(3), base_ang_vel*0.25(3), projected_gravity(3),
+         joint_pos_rel(12), joint_vel_rel*0.05(12), last_action(12)]
+        """
         robot = self.unwrapped.scene["robot"]
         cmd = self.unwrapped.command_manager.get_command("base_velocity")[:, :3]
         base_ang_vel = robot.data.root_ang_vel_b * 0.25
@@ -395,9 +399,9 @@ class HimlocoVecEnvWrapper(VecEnv):
 
     def get_wm_state(self) -> torch.Tensor:
         """
-        提取 76 维世界模型状态 s_t:
-        - 前 34 维: [root_z(1), base_lin_vel(3), base_ang_vel(3), proj_gravity(3), dof_pos_rel(12), dof_vel_rel(12)]
-        - 后 42 维: get_amp_observations() (42维，原生对齐 AMP 判别器与经验池)
+        提取 46 维无冗余统一世界模型状态 s_t:
+        [root_z(1), base_lin_vel(3), base_ang_vel(3), proj_gravity(3),
+         dof_pos_rel(12), dof_vel_rel(12), foot_pos_b(12)]
         """
         robot = self.unwrapped.scene["robot"]
         root_z = robot.data.root_pos_w[:, 2:3]
@@ -407,17 +411,50 @@ class HimlocoVecEnvWrapper(VecEnv):
         dof_pos_rel = robot.data.joint_pos - robot.data.default_joint_pos
         dof_vel_rel = robot.data.joint_vel - robot.data.default_joint_vel
         amp_obs = self.get_amp_observations()
+        foot_pos_b = amp_obs[:, 12:24]
 
         return torch.cat(
-            [root_z, base_lin_vel, base_ang_vel, proj_gravity, dof_pos_rel, dof_vel_rel, amp_obs], dim=-1
+            [root_z, base_lin_vel, base_ang_vel, proj_gravity, dof_pos_rel, dof_vel_rel, foot_pos_b], dim=-1
         ).to(device=self.device, dtype=torch.float32)
 
     def wm_state_to_amp_obs(self, wm_state: torch.Tensor) -> torch.Tensor:
-        """直接切片返回后 42 维 AMP 状态，100% 匹配 AMPDiscriminator 输入维度"""
-        return wm_state[:, 34:]
+        """
+        从 46 维世界模型状态直接可微组装 42 维 AMP 观测:
+        [joint_pos(12), foot_pos_b(12), base_lin_vel(3), base_ang_vel(3), joint_vel(12)]
+        确保 AMP 判别器的梯度 100% 传导至与 Actor / Task Reward 完全相同的状态变量！
+        """
+        robot = self.unwrapped.scene["robot"]
+        default_pos = robot.data.default_joint_pos[:1, :].to(wm_state.device)
+        default_vel = robot.data.default_joint_vel[:1, :].to(wm_state.device)
+
+        joint_pos = wm_state[:, 10:22] + default_pos
+        foot_pos_b = wm_state[:, 34:46]
+        base_lin_vel = wm_state[:, 1:4]
+        base_ang_vel = wm_state[:, 4:7]
+        joint_vel = wm_state[:, 22:34] + default_vel
+
+        return torch.cat([joint_pos, foot_pos_b, base_lin_vel, base_ang_vel, joint_vel], dim=-1)
+
+    def apply_terminal_amp_to_wm_state(
+        self, wm_state: torch.Tensor, termination_ids: torch.Tensor, terminal_amp_states: torch.Tensor
+    ) -> torch.Tensor:
+        """将 Reset 前的真实终止状态写回 46 维 wm_state，防止跨局重置瞬移污染"""
+        if termination_ids.numel() == 0:
+            return wm_state
+        robot = self.unwrapped.scene["robot"]
+        default_pos = robot.data.default_joint_pos[termination_ids].to(wm_state.device)
+        default_vel = robot.data.default_joint_vel[termination_ids].to(wm_state.device)
+
+        fixed = wm_state.clone()
+        fixed[termination_ids, 10:22] = terminal_amp_states[:, 0:12] - default_pos
+        fixed[termination_ids, 34:46] = terminal_amp_states[:, 12:24]
+        fixed[termination_ids, 1:4] = terminal_amp_states[:, 24:27]
+        fixed[termination_ids, 4:7] = terminal_amp_states[:, 27:30]
+        fixed[termination_ids, 22:34] = terminal_amp_states[:, 30:42] - default_vel
+        return fixed
 
     def get_sim_context(self) -> torch.Tensor:
-        """提取 6 维域随机化上下文 : [coms_xyz(3), base_mass(1), kp(1), kd(1)]，全在 GPU 上"""
+        """提取 6 维域随机化上下文 : [coms_xyz(3), base_mass(1), kp(1), kd(1)]"""
         robot = self.unwrapped.scene["robot"]
         num_envs = self.num_envs
 

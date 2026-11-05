@@ -265,6 +265,12 @@ class AMPOnPolicyRunner:
                 mean_est_loss_accum = 0.0
                 mean_swap_loss_accum = 0.0
 
+                # 为 4096 个并行环境分配 [0.08, 0.45] 的多尺度探索噪声：
+                # 低噪声环境验证当前策略，中高噪声环境打破静态接触摩擦，为世界模型持续提供加减速与抬腿样本！
+                env_noise_scales = torch.linspace(
+                    0.08, max(self.bptt_action_noise_std, 0.45), self.env.num_envs, device=self.device
+                ).unsqueeze(-1)
+
                 with torch.no_grad():
                     for _ in range(self.bptt_sim_steps_per_update):
                         prev_obs = obs.clone()
@@ -275,7 +281,7 @@ class AMPOnPolicyRunner:
                         xi_t = self.env.get_sim_context()
 
                         det_actions = self.alg.actor_critic.act_inference(obs)
-                        noisy_actions = det_actions + torch.randn_like(det_actions) * self.bptt_action_noise_std
+                        noisy_actions = det_actions + torch.randn_like(det_actions) * env_noise_scales
 
                         (
                             obs,
@@ -299,22 +305,20 @@ class AMPOnPolicyRunner:
                         termination_privileged_obs = termination_privileged_obs.to(self.device)
                         terminal_amp_states = terminal_amp_states.to(self.device)
 
-                        # 维护无噪历史观测队列并在 Reset 环境上清零历史
                         self.env.update_clean_obs_history(termination_ids)
                         next_state_t = self.env.get_wm_state()
                         next_clean_obs_t = self.env.get_clean_observations()
 
-                        # 还原终止环境在自动 Reset 之前的真实 AMP 状态与 Critic 状态
+                        # 还原终止环境在自动 Reset 之前的真实 46 维物理状态与 42 维 AMP 状态
+                        next_state_t_fixed = self.env.apply_terminal_amp_to_wm_state(
+                            next_state_t, termination_ids, terminal_amp_states
+                        )
                         amp_s = self.env.wm_state_to_amp_obs(state_t)
-                        amp_next_s = self.env.wm_state_to_amp_obs(next_state_t).clone()
-                        amp_next_s[termination_ids] = terminal_amp_states
-                        next_state_t_fixed = next_state_t.clone()
-                        next_state_t_fixed[:, 34:] = amp_next_s
+                        amp_next_s = self.env.wm_state_to_amp_obs(next_state_t_fixed)
 
                         next_critic_obs = critic_obs.clone().detach()
                         next_critic_obs[termination_ids] = termination_privileged_obs.clone().detach()
 
-                        # 区分真实摔倒 (falls) 与任意重置 (resets = falls | time_outs)
                         resets_mask = dones > 0
                         if "time_outs" in infos:
                             time_outs_mask = infos["time_outs"].to(self.device).bool()
@@ -338,16 +342,15 @@ class AMPOnPolicyRunner:
                         if getattr(self.alg, "amp_storage", None) is not None:
                             self.alg.amp_storage.insert(amp_s, amp_next_s)
 
-                        # 在线更新 HIMEstimator (使用还原终止状态后的 next_critic_obs)
+                        # 使用 1e-3 学习率更新 HIMEstimator，确保速度估计误差快速收敛
                         if hasattr(self.alg.actor_critic, "estimator"):
                             with torch.enable_grad():
                                 est_loss, swap_loss = self.alg.actor_critic.estimator.update(
-                                    prev_obs, next_critic_obs, lr=self.wm_lr
+                                    prev_obs, next_critic_obs, lr=1e-3
                                 )
                                 mean_est_loss_accum += est_loss / self.bptt_sim_steps_per_update
                                 mean_swap_loss_accum += swap_loss / self.bptt_sim_steps_per_update
 
-                        # 计算当前步的 AMP 风格奖励与合成奖励，同步写入四大统计 Buffer
                         self.task_rewards = rewards
                         rewards_all = self.alg.discriminator.predict_amp_reward(
                             amp_s, amp_next_s, rewards, normalizer=self.alg.amp_normalizer
