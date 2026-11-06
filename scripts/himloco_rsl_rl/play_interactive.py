@@ -228,9 +228,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: HIMOnPolicyRunnerCfg):
     env_cfg.commands.base_velocity.lateral_target_prob=0.0
     env_cfg.commands.base_velocity.ranges.lin_vel_x=(-1.0, 1.0)
     env_cfg.commands.base_velocity.dynamic_resample_commands = False
-    env_cfg.scene.terrain.terrain_type = "plane"
-    #env_cfg.scene.terrain.terrain_generator = COBBLESTONE_ROAD_CFG
-    env_cfg.curriculum.terrain_levels = None
+    #env_cfg.scene.terrain.terrain_type = "plane"
+    env_cfg.scene.terrain.terrain_generator = COBBLESTONE_ROAD_CFG
+    #env_cfg.curriculum.terrain_levels = None
 
 
     # create isaac environment

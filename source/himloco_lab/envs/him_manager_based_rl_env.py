@@ -1,36 +1,123 @@
+# Copyright (c) 2025, HimLoco Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
+
+from typing import Any, Dict
 import torch
-from typing import Dict, Any
-from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.envs import ManagerBasedRLEnv, ManagerBasedRLEnvCfg, VecEnvStepReturn
 import isaaclab.utils.math as math_utils
+import isaaclab.sim as sim_utils
+
+def _remove_online_usd_dependencies(cfg: ManagerBasedRLEnvCfg) -> None:
+    """移除环境配置中所有对 AWS S3 在线 USD / MDL / HDR 资源的依赖，确保 100% 离线可运行。"""
+    # 1. 处理 commands 中的在线 arrow_x.usd 依赖
+    if hasattr(cfg, "commands") and cfg.commands is not None:
+        for cmd_name in dir(cfg.commands):
+            if cmd_name.startswith("_"):
+                continue
+            cmd_term = getattr(cfg.commands, cmd_name, None)
+            if cmd_term is None:
+                continue
+            # 关闭训练期不必要的命令箭头可视化，并将默认在线 arrow_x.usd 替换为本地程序化几何体
+            if hasattr(cmd_term, "debug_vis"):
+                cmd_term.debug_vis = False
+            if hasattr(cmd_term, "goal_vel_visualizer_cfg") and cmd_term.goal_vel_visualizer_cfg is not None:
+                cmd_term.goal_vel_visualizer_cfg.markers = {
+                    "arrow": sim_utils.CuboidCfg(
+                        size=(0.3, 0.06, 0.06),
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),
+                    )
+                }
+            if hasattr(cmd_term, "current_vel_visualizer_cfg") and cmd_term.current_vel_visualizer_cfg is not None:
+                cmd_term.current_vel_visualizer_cfg.markers = {
+                    "arrow": sim_utils.CuboidCfg(
+                        size=(0.3, 0.06, 0.06),
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.4, 1.0)),
+                    )
+                }
+
+    # # 2. 处理 scene 中的在线地面材质 (.mdl)、天空盒 (.hdr) 与射线可视化
+    # if hasattr(cfg, "scene") and cfg.scene is not None:
+    #     # 替换在线地面 MDL 材质为本地 PreviewSurfaceCfg
+    #     if hasattr(cfg.scene, "terrain") and cfg.scene.terrain is not None:
+    #         vis_mat = getattr(cfg.scene.terrain, "visual_material", None)
+    #         if vis_mat is not None and hasattr(vis_mat, "mdl_path"):
+    #             mdl_path = str(getattr(vis_mat, "mdl_path", ""))
+    #             if mdl_path.startswith("http") or "omniverse" in mdl_path or "Nucleus" in mdl_path:
+    #                 cfg.scene.terrain.visual_material = sim_utils.PreviewSurfaceCfg(
+    #                     diffuse_color=(0.25, 0.25, 0.25)
+    #                 )
+
+    #     # 移除在线天空盒 HDR 贴图，改用纯色环境光
+    #     if hasattr(cfg.scene, "sky_light") and cfg.scene.sky_light is not None:
+    #         spawn_cfg = getattr(cfg.scene.sky_light, "spawn", None)
+    #         if spawn_cfg is not None and hasattr(spawn_cfg, "texture_file"):
+    #             tex_file = getattr(spawn_cfg, "texture_file", None)
+    #             if tex_file is not None and (str(tex_file).startswith("http") or "omniverse" in str(tex_file)):
+    #                 spawn_cfg.texture_file = None
+    #                 spawn_cfg.color = (0.75, 0.75, 0.75)
+
+    #     # 关闭所有 RayCaster 传感器的 debug_vis，避免创建大量可视化图元及潜在在线依赖
+    #     for attr_name in dir(cfg.scene):
+    #         if attr_name.startswith("_"):
+    #             continue
+    #         attr_val = getattr(cfg.scene, attr_name, None)
+    #         if hasattr(attr_val, "debug_vis") and hasattr(attr_val, "ray_alignment"):
+    #             attr_val.debug_vis = False
 
 class HimlocoManagerBasedRLEnv(ManagerBasedRLEnv):
-    """HimLoco environment with Manager-Based RL interface."""
-    
+    """HimLoco environment with Manager-Based RL interface supporting both PPO and SuperMimic BPTT."""
+
     def __init__(self, cfg, render_mode: str | None = None, **kwargs) -> None:
-        """Initialize the HimLoco environment.
-        
-        Args:
-            cfg: The configuration for the environment.
-            render_mode: The render mode for the environment. Defaults to None.
-            **kwargs: Additional keyword arguments (e.g., env_cfg_entry_point from gym.register).
-        """
+        """Initialize the HimLoco environment."""
+        # 在初始化底层环境与 Manager 之前，清除所有在线 USD/MDL/HDR 依赖
+        _remove_online_usd_dependencies(cfg)
         super().__init__(cfg, render_mode=render_mode, **kwargs)
-        self._pre_pre_action = torch.zeros((self.num_envs, self.action_manager.total_action_dim), device=self.device)
+        self._pre_pre_action = torch.zeros(
+            (self.num_envs, self.action_manager.total_action_dim), device=self.device
+        )
         # AMP: cache foot body indices for get_amp_observations()
         robot = self.scene.articulations["robot"]
         self._amp_foot_body_indices, _ = robot.find_bodies(".*_foot")
-        self.num_amp_obs = (robot.data.joint_pos.shape[1] * 2 +  # joint_pos + joint_vel
-                            len(self._amp_foot_body_indices) * 3 +  # foot_pos
-                            3 + 3 + 1)  # base_lin_vel + base_ang_vel + z_pos
-        self._capturing_step = False
+        self.num_amp_obs = (
+            robot.data.joint_pos.shape[1] * 2
+            + len(self._amp_foot_body_indices) * 3
+            + 3
+            + 3
+        )
+        self._capturing_step: bool = False
         self.terminal_physics_snapshot: tuple[torch.Tensor, torch.Tensor] | None = None
-    
+
+    def _get_ground_height(self) -> torch.Tensor:
+        """获取机身正下方的地形高度，使物理状态中的 root_pos_z 始终表示相对地面的真实离地高度。"""
+        if "base_height_scanner" in self.scene.sensors:
+            sensor = self.scene.sensors["base_height_scanner"]
+            ray_hits_z = sensor.data.ray_hits_w[..., 2]
+            valid = ~torch.isnan(ray_hits_z) & ~torch.isinf(ray_hits_z) & (torch.abs(ray_hits_z) < 1e4)
+            if valid.any():
+                masked_z = torch.where(valid, ray_hits_z, torch.zeros_like(ray_hits_z))
+                count = valid.float().sum(dim=1).clamp_min(1.0)
+                ground_z = masked_z.sum(dim=1) / count
+                all_invalid = valid.sum(dim=1) == 0
+                if all_invalid.any():
+                    ground_z[all_invalid] = self.scene.env_origins[all_invalid, 2]
+                return ground_z
+        return self.scene.env_origins[:, 2]
+
     def read_physics_state(self) -> torch.Tensor:
-        """读取 37 维物理状态: [root_pos_local(3), root_quat_wxyz(4), root_lin_vel_w(3),
-        root_ang_vel_w(3), joint_pos(12), joint_vel(12)]
+        """读取 37 维物理状态 (对齐 SuperMimic WorldModel 格式):
+        [root_pos_local(3), root_quat_wxyz(4), root_lin_vel_w(3),
+         root_ang_vel_w(3), joint_pos(12), joint_vel(12)]
         """
-        robot = self.scene["robot"]
-        root_pos = robot.data.root_pos_w - self.scene.env_origins
+        robot = self.scene.articulations["robot"]
+        root_pos_xy = robot.data.root_pos_w[:, :2] - self.scene.env_origins[:, :2]
+        ground_z = self._get_ground_height()
+        root_pos_z = (robot.data.root_pos_w[:, 2] - ground_z).unsqueeze(-1)
+        root_pos = torch.cat((root_pos_xy, root_pos_z), dim=-1)
+
         root_quat_wxyz = robot.data.root_quat_w
         root_lin_vel_w = robot.data.root_lin_vel_w
         root_ang_vel_w = robot.data.root_ang_vel_w
@@ -41,40 +128,20 @@ class HimlocoManagerBasedRLEnv(ManagerBasedRLEnv):
             dim=-1,
         ).clone()
 
-    def _reset_idx(self, env_ids: torch.Tensor):
-        if self._capturing_step and len(env_ids) > 0:
-            ids = env_ids.clone()
-            self.terminal_physics_snapshot = (ids, self.read_physics_state()[ids].clone())
-        super()._reset_idx(env_ids)
-        if hasattr(self, "pre_pre_action") and len(env_ids) > 0:
-            self.pre_pre_action[env_ids] = 0.0
-
-    def step(self, action: torch.Tensor) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any], torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Execute one time-step of the environment's dynamics and reset terminated environments.
-
-        Unlike the :class:`ManagerBasedEnv.step` class, the function performs the following operations:
-
-        1. Process the actions.
-        2. Perform physics stepping.
-        3. Capture observations before reset.
-        4. Perform rendering if gui is enabled.
-        5. Update the environment counters and compute the rewards and terminations.
-        6. Reset the environments that terminated.
-        7. Compute the observations after reset.
-        8. Return the observations (after reset), observations (before reset), rewards, resets and extras.
-
-        Args:
-            action: The actions to apply on the environment. Shape is (num_envs, action_dim).
-
-        Returns:
-            A tuple containing:
-                - obs_buf: Current observations after reset (Dict[str, torch.Tensor])
-                - obs_buf_before_reset: Observations before reset (Dict[str, torch.Tensor])
-                - reward_buf: Rewards for each environment (torch.Tensor)
-                - reset_terminated: Termination flags (torch.Tensor)
-                - reset_time_outs: Timeout flags (torch.Tensor)
-                - extras: Additional information dictionary (Dict[str, Any])
-        """
+    def step(
+        self, action: torch.Tensor
+    ) -> tuple[
+        Dict[str, torch.Tensor],
+        Dict[str, torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Dict[str, Any],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Execute one time-step of the environment's dynamics and reset terminated environments."""
         # process actions
         self._pre_pre_action = self.action_manager.prev_action.clone()
         self.action_manager.process_action(action.to(self.device))
@@ -82,32 +149,23 @@ class HimlocoManagerBasedRLEnv(ManagerBasedRLEnv):
         self.recorder_manager.record_pre_step()
 
         # check if we need to do rendering within the physics loop
-        # note: checked here once to avoid multiple checks within the loop
         is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
 
         # perform physics stepping
         for _ in range(self.cfg.decimation):
             self._sim_step_counter += 1
-            # set actions into buffers
             self.action_manager.apply_action()
-            # set actions into simulator
             self.scene.write_data_to_sim()
-            # simulate
             self.sim.step(render=False)
-            # render between steps only if the GUI or an RTX sensor needs it
-            # note: we assume the render interval to be the shortest accepted rendering interval.
-            #    If a camera needs rendering at a faster frequency, this will lead to unexpected behavior.
             if self._sim_step_counter % self.cfg.sim.render_interval == 0 and is_rendering:
                 self.sim.render()
-            # update buffers at sim dt
             self.scene.update(dt=self.physics_dt)
 
         # -- get observations before reset
         self.obs_buf_before_reset = self.observation_manager.compute()
         # post-step:
-        # -- update env counters (used for curriculum generation)
-        self.episode_length_buf += 1  # step in current episode (per env)
-        self.common_step_counter += 1  # total step (common for all envs)
+        self.episode_length_buf += 1
+        self.common_step_counter += 1
         # -- check terminations
         self.reset_buf = self.termination_manager.compute()
         self.reset_terminated = self.termination_manager.terminated
@@ -116,90 +174,69 @@ class HimlocoManagerBasedRLEnv(ManagerBasedRLEnv):
         self.reward_buf = self.reward_manager.compute(dt=self.step_dt)
 
         if len(self.recorder_manager.active_terms) > 0:
-            # update observations for recording if needed
             self.obs_buf = self.observation_manager.compute()
             self.recorder_manager.record_post_step()
-            
 
         # -- reset envs that terminated/timed-out and log the episode information
+        self.terminal_physics_snapshot = None
         reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(reset_env_ids) > 0:
-            #self.extras['episode'] = dict()
-            # trigger recorder terms for pre-reset calls
             self.recorder_manager.record_pre_reset(reset_env_ids)
-            
-            
 
-            # -- capture terminal AMP states before reset
-            terminal_amp_states = self.get_amp_observations()[reset_env_ids]
-
-            #reward_extras = self.reward_manager.reset(reset_env_ids)
-            #self.extras['episode'].update(reward_extras)
+            # -- capture terminal AMP states & 37D physics states BEFORE reset
+            terminal_amp_states = self.get_amp_observations()[reset_env_ids].clone()
+            self.terminal_physics_snapshot = (
+                reset_env_ids.clone(),
+                self.read_physics_state()[reset_env_ids].clone(),
+            )
 
             self._reset_idx(reset_env_ids)
             self._pre_pre_action[reset_env_ids] = 0.0
             self.action_manager.reset(reset_env_ids)
-            
+
             # update articulation kinematics
             self.scene.write_data_to_sim()
             self.sim.forward()
 
-            # if sensors are added to the scene, make sure we render to reflect changes in reset
             if self.sim.has_rtx_sensors() and self.cfg.rerender_on_reset:
                 self.sim.render()
 
-            # trigger recorder terms for post-reset calls
             self.recorder_manager.record_post_reset(reset_env_ids)
         else:
-            # -- capture terminal AMP states before reset
             terminal_amp_states = self.get_amp_observations()[reset_env_ids]
-            # terminal_amp_states = torch.zeros(0, self.num_amp_obs, device=self.device)
 
         # -- update command
         self.command_manager.compute(dt=self.step_dt)
         # -- step interval events
         if "interval" in self.event_manager.available_modes:
             self.event_manager.apply(mode="interval", dt=self.step_dt)
-        # -- compute observations
-        # note: done after reset to get the correct observations for reset envs
+        # -- compute observations after reset
         self.obs_buf = self.observation_manager.compute(update_history=True)
 
-        # return observations, rewards, resets and extras
-        return (self.obs_buf, self.obs_buf_before_reset, self.reward_buf,
-                self.reset_terminated, self.reset_time_outs, self.extras,
-                reset_env_ids, self.obs_buf_before_reset.get("critic", self.obs_buf_before_reset["policy"]),
-                terminal_amp_states)
+        return (
+            self.obs_buf,
+            self.obs_buf_before_reset,
+            self.reward_buf,
+            self.reset_terminated,
+            self.reset_time_outs,
+            self.extras,
+            reset_env_ids,
+            self.obs_buf_before_reset.get("critic", self.obs_buf_before_reset["policy"]),
+            terminal_amp_states,
+        )
+
     @property
     def pre_pre_action(self) -> torch.Tensor:
-        """The previous  previous actions sent to the environment. Shape is (num_envs, total_action_dim)."""
+        """The previous-previous actions sent to the environment. Shape is (num_envs, total_action_dim)."""
         return self._pre_pre_action
-    
-    # def get_amp_observations(self) -> torch.Tensor:
-    #     """Get AMP observations for discriminator training.
-        
-    #     Returns tensor of shape (num_envs, num_amp_obs):
-    #         joint_pos + foot_pos + base_lin_vel + base_ang_vel + joint_vel + z_pos
-    #     """
-    #     robot = self.scene.articulations["robot"]
-    #     joint_pos = robot.data.joint_pos
-    #     joint_vel = robot.data.joint_vel
-    #     base_lin_vel = robot.data.root_lin_vel_w
-    #     base_ang_vel = robot.data.root_ang_vel_w
-    #     z_pos = robot.data.root_pos_w[:, 2:3]
-        
-    #     # Foot positions in world frame
-    #     foot_pos = robot.data.body_pos_w[:, self._amp_foot_body_indices, :] - robot.data.root_pos_w[:, :].unsqueeze(1)  #robot.data.body_pos_w[:, self._amp_foot_body_indices, :]
-    #     foot_pos = foot_pos.flatten(1)  # (num_envs, num_feet * 3) 
-        
-    #     return torch.cat([
-    #         joint_pos, foot_pos, base_lin_vel, base_ang_vel, joint_vel, z_pos
-    #     ], dim=-1)
+
+    @pre_pre_action.setter
+    def pre_pre_action(self, value: torch.Tensor) -> None:
+        self._pre_pre_action = value
 
     def get_amp_observations(self) -> torch.Tensor:
-        """Get AMP observations for discriminator training.
-        
-        Returns tensor of shape (num_envs, num_amp_obs):
-            joint_pos + base_lin_vel + base_ang_vel + joint_vel
+        """Get 42D AMP observations for discriminator training:
+        [joint_pos(12), foot_pos_b(12), base_lin_vel_b(3), base_ang_vel_b(3), joint_vel(12)]
         """
         robot = self.scene.articulations["robot"]
         joint_pos = robot.data.joint_pos
@@ -207,14 +244,17 @@ class HimlocoManagerBasedRLEnv(ManagerBasedRLEnv):
         base_lin_vel = robot.data.root_lin_vel_b
         base_ang_vel = robot.data.root_ang_vel_b
 
-        # Foot positions in local frame
-        footpos_translated = robot.data.body_pos_w[:, self._amp_foot_body_indices, :] - robot.data.root_pos_w[:, :].unsqueeze(1)
-        footpos_in_body_frame = footpos_translated
+        footpos_translated = (
+            robot.data.body_pos_w[:, self._amp_foot_body_indices, :]
+            - robot.data.root_pos_w[:, :].unsqueeze(1)
+        )
+        footpos_in_body_frame = torch.zeros_like(footpos_translated)
         for i in range(len(self._amp_foot_body_indices)):
-            footpos_in_body_frame[:,i,:] = math_utils.quat_apply_inverse(robot.data.root_quat_w, footpos_translated[:,i,:])
-        #robot.data.body_pos_w[:, self._amp_foot_body_indices, :]
-        foot_pos = footpos_in_body_frame.flatten(1)  # (num_envs, num_feet * 3)
-        
-        return torch.cat([
-            joint_pos, foot_pos, base_lin_vel, base_ang_vel, joint_vel
-        ], dim=-1)
+            footpos_in_body_frame[:, i, :] = math_utils.quat_apply_inverse(
+                robot.data.root_quat_w, footpos_translated[:, i, :]
+            )
+        foot_pos = footpos_in_body_frame.flatten(1)
+
+        return torch.cat(
+            [joint_pos, foot_pos, base_lin_vel, base_ang_vel, joint_vel], dim=-1
+        )
