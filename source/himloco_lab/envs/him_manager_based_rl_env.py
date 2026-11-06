@@ -22,6 +22,32 @@ class HimlocoManagerBasedRLEnv(ManagerBasedRLEnv):
         self.num_amp_obs = (robot.data.joint_pos.shape[1] * 2 +  # joint_pos + joint_vel
                             len(self._amp_foot_body_indices) * 3 +  # foot_pos
                             3 + 3 + 1)  # base_lin_vel + base_ang_vel + z_pos
+        self._capturing_step = False
+        self.terminal_physics_snapshot: tuple[torch.Tensor, torch.Tensor] | None = None
+    
+    def read_physics_state(self) -> torch.Tensor:
+        """读取 37 维物理状态: [root_pos_local(3), root_quat_wxyz(4), root_lin_vel_w(3),
+        root_ang_vel_w(3), joint_pos(12), joint_vel(12)]
+        """
+        robot = self.scene["robot"]
+        root_pos = robot.data.root_pos_w - self.scene.env_origins
+        root_quat_wxyz = robot.data.root_quat_w
+        root_lin_vel_w = robot.data.root_lin_vel_w
+        root_ang_vel_w = robot.data.root_ang_vel_w
+        joint_pos = robot.data.joint_pos
+        joint_vel = robot.data.joint_vel
+        return torch.cat(
+            (root_pos, root_quat_wxyz, root_lin_vel_w, root_ang_vel_w, joint_pos, joint_vel),
+            dim=-1,
+        ).clone()
+
+    def _reset_idx(self, env_ids: torch.Tensor):
+        if self._capturing_step and len(env_ids) > 0:
+            ids = env_ids.clone()
+            self.terminal_physics_snapshot = (ids, self.read_physics_state()[ids].clone())
+        super()._reset_idx(env_ids)
+        if hasattr(self, "pre_pre_action") and len(env_ids) > 0:
+            self.pre_pre_action[env_ids] = 0.0
 
     def step(self, action: torch.Tensor) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any], torch.Tensor, torch.Tensor, torch.Tensor]:
         """Execute one time-step of the environment's dynamics and reset terminated environments.

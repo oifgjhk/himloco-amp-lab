@@ -246,235 +246,167 @@ class AMPPPO:
 
         return mean_value_loss, mean_surrogate_loss, estimation_loss, swap_loss,mean_amp_loss, mean_grad_pen_loss, mean_policy_pred, mean_expert_pred
     
-    def init_supermimic_world_model(
+    def init_supermimic_bptt(
         self,
-        state_dim: int,
-        action_dim: int,
-        context_dim: int,
-        wm_state_to_amp_obs_fn,
-        cmd_dim: int = 3,
+        num_envs: int,
+        num_joints: int = 12,
+        num_one_step_obs: int = 45,
+        default_joint_pos: torch.Tensor | None = None,
+        joint_limits: torch.Tensor | None = None,
+        wm_width: int = 2048,
         wm_lr: float = 2e-4,
-        bptt_horizon: int = 32,
-        wm_window_len: int = 8,
+        actor_lr: float = 2e-4,
+        critic_lr: float = 2e-4,
+        horizon: int = 32,
+        wm_buffer_steps: int = 256,
     ):
-        from himloco_lab.rsl_rl.modules.world_model import DifferentiableWorldModel
+        from himloco_lab.rsl_rl.modules.world_model import WorldModel, BPTTValueModel
+        from himloco_lab.rsl_rl.storage.wm_replay_buffer import WMReplayBuffer
 
-        self.bptt_horizon = bptt_horizon
-        self.wm_window_len = wm_window_len
-        self.wm_state_to_amp_obs_fn = wm_state_to_amp_obs_fn
-
-        self.world_model = DifferentiableWorldModel(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            context_dim=context_dim,
-            cmd_dim=cmd_dim,
-            device=self.device,
+        self.bptt_horizon = horizon
+        self.num_one_step_obs = num_one_step_obs
+        self.world_model = WorldModel(
+            joints=num_joints,
+            frame_dim=num_one_step_obs,
+            hidden=(wm_width, wm_width, wm_width),
+            contact_dim=4,
+            default_joint_pos=default_joint_pos,
+            joint_limits=joint_limits,
         ).to(self.device)
+        self.bptt_critic = BPTTValueModel(self.world_model.inp_dim, command_dim=3).to(self.device)
+        self.wm_replay = WMReplayBuffer(wm_buffer_steps, num_envs, device=self.device)
 
-        wm_params = (
-            list(self.world_model.dynamics_net.parameters())
-            + list(self.world_model.reward_head.parameters())
-            + list(self.world_model.term_head.parameters())
-        )
-        self.wm_optimizer = torch.optim.Adam(wm_params, lr=wm_lr, betas=(0.9, 0.95))
+        self.wm_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=wm_lr)
         self.bptt_actor_optimizer = torch.optim.Adam(
-            self.actor_critic.actor.parameters(), lr=wm_lr, betas=(0.9, 0.95)
+            self.actor_critic.actor.parameters(), lr=actor_lr, betas=(0.9, 0.95)
         )
-        self.bptt_critic_optimizer = torch.optim.Adam(
-            self.world_model.wm_critic.parameters(), lr=wm_lr, betas=(0.9, 0.95)
-        )
-        # 独立的判别器优化器，避免触碰 self.optimizer 中的 actor_critic 动量
-        self.bptt_disc_optimizer = torch.optim.Adam(
-            self.discriminator.parameters(), lr=wm_lr, betas=(0.9, 0.95)
-        )
+        self.bptt_critic_optimizer = torch.optim.Adam(self.bptt_critic.parameters(), lr=critic_lr)
 
-    def update_world_model(self, wm_buffer, num_batches: int = 10, batch_size: int = 2048) -> dict[str, float]:
+    def update_world_model(self, wm_batches: int = 10, wm_batch_size: int = 2048) -> dict[str, float]:
+        from himloco_lab.rsl_rl.modules.world_model import compute_wm_rollout_loss
+
         self.world_model.train()
-        agg_metrics = {
-            "wm_loss_total": 0.0,
-            "wm_loss_state": 0.0,
-            "wm_loss_reward": 0.0,
-            "wm_loss_done": 0.0,
-            "amp_disc_loss": 0.0,
-            "amp_grad_pen": 0.0,
-        }
-
-        expert_gen = self.amp_data.feed_forward_generator(num_batches, batch_size)
-
-        for _ in range(num_batches):
-            (
-                s_seq, a_seq, o_seq, r_seq, falls_seq, resets_seq, cmd_seq, xi_seq
-            ) = wm_buffer.sample_k_step_windows(batch_size=batch_size, k=self.wm_window_len)
-
-            self.world_model.state_norm.update(s_seq.reshape(-1, s_seq.shape[-1]))
-            valid_deltas = (s_seq[:, 1:, :] - s_seq[:, :-1, :])[~resets_seq]
-            if valid_deltas.numel() > 0:
-                self.world_model.delta_norm.update(valid_deltas.reshape(-1, s_seq.shape[-1]))
-            self.world_model.context_norm.update(xi_seq.reshape(-1, xi_seq.shape[-1]))
-
-            loss, metrics = self.world_model.compute_k_step_loss(
-                s_seq, a_seq, o_seq, r_seq, falls_seq, resets_seq, cmd_seq, xi_seq
-            )
-            self.wm_optimizer.zero_grad()
+        metrics_accum = {}
+        for _ in range(wm_batches):
+            window = self.wm_replay.sample_prefix(wm_batch_size, horizon=8)
+            self.wm_optimizer.zero_grad(set_to_none=True)
+            loss, info = compute_wm_rollout_loss(self.world_model, window)
             loss.backward()
-            nn.utils.clip_grad_norm_(self.world_model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 1.0)
             self.wm_optimizer.step()
+            for k, v in info.items():
+                metrics_accum[k] = metrics_accum.get(k, 0.0) + float(v) / wm_batches
+        return metrics_accum
 
-            for k_name, v in metrics.items():
-                agg_metrics[k_name] += v / num_batches
-
-            valid_trans = ~resets_seq[:, 0]
-            if valid_trans.any() and self.amp_data is not None:
-                policy_s = self.wm_state_to_amp_obs_fn(s_seq[valid_trans, 0, :]).detach()
-                policy_next_s = self.wm_state_to_amp_obs_fn(s_seq[valid_trans, 1, :]).detach()
-                expert_s, expert_next_s = next(expert_gen)
-                n_min = min(policy_s.shape[0], expert_s.shape[0])
-                policy_s, policy_next_s = policy_s[:n_min], policy_next_s[:n_min]
-                expert_s, expert_next_s = expert_s[:n_min], expert_next_s[:n_min]
-
-                if self.amp_normalizer is not None:
-                    self.amp_normalizer.update(policy_s.cpu().numpy())
-                    self.amp_normalizer.update(expert_s.cpu().numpy())
-                    policy_s = self.amp_normalizer.normalize_torch(policy_s, self.device)
-                    policy_next_s = self.amp_normalizer.normalize_torch(policy_next_s, self.device)
-                    expert_s = self.amp_normalizer.normalize_torch(expert_s, self.device)
-                    expert_next_s = self.amp_normalizer.normalize_torch(expert_next_s, self.device)
-
-                expert_d = self.discriminator(torch.cat([expert_s, expert_next_s], dim=-1))
-                policy_d = self.discriminator(torch.cat([policy_s, policy_next_s], dim=-1))
-
-                expert_loss = torch.nn.MSELoss()(expert_d, torch.ones_like(expert_d))
-                policy_loss = torch.nn.MSELoss()(policy_d, -1.0 * torch.ones_like(policy_d))
-                amp_loss = 0.5 * (expert_loss + policy_loss)
-                grad_pen = self.discriminator.compute_grad_pen(expert_s, expert_next_s, lambda_=10.0)
-
-                self.bptt_disc_optimizer.zero_grad()
-                (amp_loss + grad_pen).backward()
-                nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
-                self.bptt_disc_optimizer.step()
-
-                agg_metrics["amp_disc_loss"] += amp_loss.item() / num_batches
-                agg_metrics["amp_grad_pen"] += grad_pen.item() / num_batches
-
-        return agg_metrics
-
-    def sample_sensor_noise(self, clean_obs: torch.Tensor) -> torch.Tensor:
-        """严格对齐 ecow PolicyCfg 的噪声与缩放系数 (ang_vel scale=0.25, joint_vel scale=0.05)"""
-        noise = torch.zeros_like(clean_obs)
-        noise[..., 3:6].uniform_(-0.2 * 0.25, 0.2 * 0.25)
-        noise[..., 6:9].uniform_(-0.05, 0.05)
-        noise[..., 9:21].uniform_(-0.01, 0.01)
-        noise[..., 21:33].uniform_(-1.5 * 0.05, 1.5 * 0.05)
-        return clean_obs + noise
-
-    def update_bptt(self, wm_buffer, batch_size: int = 4096) -> dict[str, float]:
-        H = self.bptt_horizon
-        for p in self.world_model.parameters():
-            p.requires_grad_(False)
-        for p in self.discriminator.parameters():
-            p.requires_grad_(False)
-        if hasattr(self.actor_critic, "estimator"):
-            for p in self.actor_critic.estimator.parameters():
-                p.requires_grad_(False)
-
-        s_t, clean_obs_hist_t, cmd, xi = wm_buffer.sample_initial_states(batch_size=batch_size)
-        noisy_obs_hist_t = self.sample_sensor_noise(clean_obs_hist_t)
-
-        survival_c = torch.ones(batch_size, device=self.device)
-        discount = 1.0
-
-        imagined_states, imagined_commands, imagined_contexts = [], [], []
-        imagined_rewards, imagined_dones = [], []
-        policy_return = torch.zeros(batch_size, device=self.device)
-
-        lerp = getattr(self.discriminator, "task_reward_lerp", 0.7)
-        reward_coef = getattr(self.discriminator, "reward_coef", 0.05)
-
-        for t in range(H):
-            imagined_states.append(s_t)
-            imagined_commands.append(cmd)
-            imagined_contexts.append(xi)
-
-            curr_obs_hist_flat = noisy_obs_hist_t.reshape(batch_size, -1)
-            prev_action = noisy_obs_hist_t[:, 0, 33:45]
-
-            if hasattr(self.actor_critic, "estimator") and hasattr(
-                self.actor_critic.estimator, "forward_with_grad"
-            ):
-                vel, latent = self.actor_critic.estimator.forward_with_grad(curr_obs_hist_flat)
-                raw_actions = self.actor_critic.actor(
-                    torch.cat([curr_obs_hist_flat[:, :45], vel, latent], dim=-1)
-                )
-            else:
-                raw_actions = self.actor_critic.act_inference(curr_obs_hist_flat)
-
-            actions = 10.0 * torch.tanh(raw_actions / 10.0)
-
-            next_s_t, next_clean_obs, pred_task_rew, _, pred_done_prob = self.world_model.forward_step(
-                s_t, actions, prev_action, xi, cmd
-            )
-
-            # 从 46 维统一状态可微重构 42 维 AMP 状态
-            amp_s = self.wm_state_to_amp_obs_fn(s_t)
-            amp_next_s = self.wm_state_to_amp_obs_fn(next_s_t)
-            if self.amp_normalizer is not None:
-                amp_s_norm = self.amp_normalizer.normalize_torch(amp_s, self.device)
-                amp_next_s_norm = self.amp_normalizer.normalize_torch(amp_next_s, self.device)
-            else:
-                amp_s_norm, amp_next_s_norm = amp_s, amp_next_s
-
-            disc_logits = self.discriminator(torch.cat([amp_s_norm, amp_next_s_norm], dim=-1))
-            # Leaky-LSGAN：消除 disc_logits <= -1.0 时的 clamp(min=0) 梯度死区，持续提供迈步风格梯度！
-            raw_amp_rew = 1.0 - 0.25 * torch.square(disc_logits - 1.0)
-            amp_rew = torch.where(raw_amp_rew >= 0.0, raw_amp_rew, 0.25 * raw_amp_rew).squeeze(-1)
-            is_moving = (torch.norm(cmd[:, :3], dim=-1) >= 0.1).float()
-            amp_rew = amp_rew * is_moving * reward_coef
-
-            step_reward = (1.0 - lerp) * amp_rew + lerp * pred_task_rew
-            policy_return = policy_return + discount * survival_c * step_reward
-
-            imagined_rewards.append(step_reward)
-            imagined_dones.append(pred_done_prob)
-
-            survival_c = survival_c * (1.0 - pred_done_prob)
-            discount *= self.gamma
-
-            noisy_next_obs = self.sample_sensor_noise(next_clean_obs)
-            noisy_obs_hist_t = torch.cat(
-                [noisy_next_obs.unsqueeze(1), noisy_obs_hist_t[:, :-1, :]], dim=1
-            )
-            s_t = next_s_t
-
-        terminal_value = self.world_model.evaluate_critic(s_t, cmd, xi).squeeze(-1)
-        policy_return = policy_return + discount * survival_c * terminal_value
-
-        actor_loss = -policy_return.mean()
-        self.bptt_actor_optimizer.zero_grad()
-        actor_loss.backward()
-        nn.utils.clip_grad_norm_(self.actor_critic.actor.parameters(), max_norm=1.0)
-        for p in self.actor_critic.actor.parameters():
-            if p.grad is not None:
-                p.grad.data.clamp_(-0.1, 0.1)
-        self.bptt_actor_optimizer.step()
-
-        for p in self.world_model.parameters():
-            p.requires_grad_(True)
-        for p in self.discriminator.parameters():
-            p.requires_grad_(True)
-        if hasattr(self.actor_critic, "estimator"):
-            for p in self.actor_critic.estimator.parameters():
-                p.requires_grad_(True)
-
-        critic_loss_val = self._update_critic_on_imagined(
-            imagined_states, imagined_commands, imagined_contexts,
-            imagined_rewards, imagined_dones, terminal_value.detach()
+    def update_bptt_step(
+        self,
+        batch_size: int = 1024,
+        wm_batches: int = 10,
+        wm_batch_size: int = 2048,
+        critic_epochs: int = 5,
+        critic_minibatches: int = 4,
+    ) -> dict[str, float]:
+        from himloco_lab.rsl_rl.modules.world_model import (
+            freeze_parameters,
+            critic_input,
+            update_bptt_critic,
         )
 
-        return {
-            "bptt_actor_return": (-actor_loss).item(),
-            "bptt_critic_loss": critic_loss_val,
-            "bptt_mean_survival_H": survival_c.mean().item(),
+        # 1. 更新世界模型 (8步自回归损失)
+        wm_metrics = self.update_world_model(wm_batches=wm_batches, wm_batch_size=wm_batch_size)
+
+        # 2. 更新 Estimator (使用真实观测历史与真实线速度)
+        starts = self.wm_replay.sample_starts(batch_size)
+        if hasattr(self.actor_critic, "estimator") and hasattr(self.actor_critic.estimator, "update"):
+            # 从 starts['state'] 提取机身系真实线速度供 estimator 监督学习
+            from himloco_lab.rsl_rl.modules.world_model import unpack_state, quat_to_mat, mv
+            _, quat, lin_vel_w, _, _, _ = unpack_state(starts["state"], self.world_model.joints)
+            true_lin_vel_b = mv(quat_to_mat(quat).transpose(-1, -2), lin_vel_w) * 2.0
+            est_Input = torch.cat((starts["obs_history"][:, :self.num_one_step_obs], true_lin_vel_b), dim=-1)
+            try:
+                est_loss, _ = self.actor_critic.estimator.update(est_Input, starts["obs_history"])
+                wm_metrics["estimator_loss"] = float(est_loss)
+            except Exception:
+                pass
+
+        # 3. 32步可微想象滚动更新 Actor (冻结 WM, Critic, Estimator, Discriminator)
+        state = starts["state"]
+        obs_history = starts["obs_history"]
+        prev_action = starts["action"]
+        pre_pre_action = starts["prev_action"]
+        command = starts["command"]
+
+        critic_inputs, rewards, continuations = [], [], []
+
+        with freeze_parameters(
+            self.world_model,
+            self.bptt_critic,
+            getattr(self.actor_critic, "estimator", None),
+            getattr(self, "discriminator", None),
+        ):
+            self.bptt_actor_optimizer.zero_grad(set_to_none=True)
+
+            for _ in range(self.bptt_horizon):
+                critic_inputs.append(critic_input(self.world_model, state, prev_action, command))
+                action = self.actor_critic.act_bptt(obs_history)
+                next_state, _, pred_rew, death_logit = self.world_model.predict(state, action)
+
+                step_rew, cont = self.world_model.compute_differentiable_reward_and_continuation(
+                    state, next_state, action, prev_action, pre_pre_action, command, pred_rew, death_logit
+                )
+
+                # 构建下一时刻单帧可微观测，并按 HimLoco 最新帧在最前 ([:, :45]) 的格式滚动更新历史
+                next_frame = self.world_model.build_actor_frame(next_state, action, command)
+                obs_history = torch.cat((next_frame, obs_history[:, :-self.num_one_step_obs]), dim=-1)
+
+                rewards.append(step_rew)
+                continuations.append(cont)
+                pre_pre_action = prev_action
+                prev_action = action
+                state = next_state
+
+            critic_inputs.append(critic_input(self.world_model, state, prev_action, command))
+            c_in_stack = torch.stack(critic_inputs, dim=0)     # [H+1, B, D]
+            rew_stack = torch.stack(rewards, dim=0)            # [H, B]
+            cont_stack = torch.stack(continuations, dim=0)     # [H, B]
+
+            # 计算软存活累积权重与终端价值 Bootstrap (对齐 SuperMimic Eq. 2)
+            alive = torch.cumprod(cont_stack, dim=0)
+            weights = torch.cat((torch.ones_like(alive[:1]), alive[:-1]), dim=0)
+            discounts = (self.gamma ** torch.arange(self.bptt_horizon, device=state.device, dtype=state.dtype))[:, None]
+
+            imagined_return = (discounts * weights * rew_stack).sum(dim=0)
+            bootstrap = (self.gamma ** self.bptt_horizon) * alive[-1] * self.bptt_critic(c_in_stack[-1])
+            objective = (imagined_return + bootstrap).mean()
+
+            (-objective).backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_critic.actor.parameters(), 1.0)
+            torch.nn.utils.clip_grad_value_(self.actor_critic.actor.parameters(), 0.1)
+            self.bptt_actor_optimizer.step()
+
+        # 4. 使用脱离计算图的想象轨迹更新 BPTT Critic (GAE 目标)
+        rollout_data = {
+            "critic_inputs": c_in_stack.detach(),
+            "rewards": rew_stack.detach(),
+            "continuations": cont_stack.detach(),
         }
+        v_loss = update_bptt_critic(
+            self.bptt_critic,
+            self.bptt_critic_optimizer,
+            rollout_data,
+            epochs=critic_epochs,
+            minibatches=critic_minibatches,
+            gamma=self.gamma,
+            lam=self.lam,
+        )
+
+        wm_metrics.update({
+            "bptt_imagined_return": float(imagined_return.mean().detach()),
+            "bptt_critic_loss": float(v_loss),
+            "bptt_actor_grad_norm": float(grad_norm.detach()),
+            "bptt_survival_rate": float(alive[-1].mean().detach()),
+        })
+        return wm_metrics
 
     def _update_critic_on_imagined(
         self, states_list, cmds_list, xis_list, rewards_list, dones_list, v_H: torch.Tensor

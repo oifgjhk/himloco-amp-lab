@@ -477,3 +477,42 @@ class HimlocoVecEnvWrapper(VecEnv):
             damping = torch.ones(num_envs, 1, device=self.device, dtype=torch.float32)
 
         return torch.cat([self._cached_static_context, stiffness, damping], dim=-1)
+
+    def get_physics_state(self) -> torch.Tensor:
+        """获取当前环境的 37 维物理状态 (SuperMimic WorldModel 格式)"""
+        if hasattr(self.unwrapped, "read_physics_state"):
+            return self.unwrapped.read_physics_state()
+        robot = self.unwrapped.scene["robot"]
+        root_pos = robot.data.root_pos_w - self.unwrapped.scene.env_origins
+        return torch.cat(
+            (
+                root_pos,
+                robot.data.root_quat_w,
+                robot.data.root_lin_vel_w,
+                robot.data.root_ang_vel_w,
+                robot.data.joint_pos,
+                robot.data.joint_vel,
+            ),
+            dim=-1,
+        ).clone()
+
+    def get_post_step_physics_state(self) -> torch.Tensor:
+        """获取 step 后的真实下一物理状态（自动还原被 _reset_idx 覆盖的终止环境状态）"""
+        next_state = self.get_physics_state()
+        snapshot = getattr(self.unwrapped, "terminal_physics_snapshot", None)
+        if snapshot is not None:
+            reset_ids, term_state = snapshot
+            next_state[reset_ids] = term_state
+        return next_state
+
+    def get_velocity_commands(self) -> torch.Tensor:
+        """获取当前 [vx, vy, wz] 速度指令 (shape: [num_envs, 3])"""
+        return self.unwrapped.command_manager.get_command("base_velocity").clone()
+
+    def get_feet_contact(self) -> torch.Tensor:
+        """获取四足触地布尔状态 (shape: [num_envs, 4])"""
+        contact_sensor = self.unwrapped.scene.sensors["contact_forces"]
+        if not hasattr(self, "_foot_body_ids"):
+            self._foot_body_ids, _ = contact_sensor.find_bodies(".*_foot")
+        forces_z = contact_sensor.data.net_forces_w[:, self._foot_body_ids, 2]
+        return (torch.abs(forces_z) > 1.0).float().clone()

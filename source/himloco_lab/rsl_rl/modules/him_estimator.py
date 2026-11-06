@@ -154,9 +154,9 @@ def get_activation(act_name):
         print("invalid activation function!")
         return None
 
-def forward_with_grad(self, obs_history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """用于 BPTT 想象滚动：保留 (vel, z) 对输入 obs_history 的计算图梯度"""
-        parts = self.encoder(obs_history)
-        vel, z = parts[..., :3], parts[..., 3:]
-        z = F.normalize(z, dim=-1, p=2)
-        return vel, z
+def encode_differentiable(self, obs_history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """BPTT 专用可微编码接口：不调用 .detach()，允许策略梯度穿透历史观测帧"""
+    parts = self.encoder(obs_history.float())
+    vel, z = parts[..., :3], parts[..., 3:]
+    z = F.normalize(z, dim=-1, p=2.0)
+    return vel, z

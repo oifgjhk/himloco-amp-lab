@@ -139,6 +139,9 @@ class AMPActorCritic(nn.Module):
         # self.init_memory_weights(self.memory_a, 0.001, 0.)
         # self.init_memory_weights(self.memory_c, 0.001, 0.)
 
+        torch.nn.init.orthogonal_(self.actor[-1].weight, gain=0.01)
+        torch.nn.init.zeros_(self.actor[-1].bias)
+
     @staticmethod
     # not used at the moment
     def init_weights(sequential, scales):
@@ -212,6 +215,17 @@ class AMPActorCritic(nn.Module):
     def evaluate(self, critic_observations, **kwargs):
         value = self.critic(critic_observations)
         return value
+
+    def act_bptt(self, obs_history: torch.Tensor) -> torch.Tensor:
+        """SuperMimic BPTT 想象滚动专用确定性前向传播（保留完整梯度图，无随机噪声）"""
+        if hasattr(self.estimator, "encode_differentiable"):
+            vel, z = self.estimator.encode_differentiable(obs_history)
+        else:
+            parts = self.estimator.encoder(obs_history.float())
+            vel, z = parts[..., :3], F.normalize(parts[..., 3:], dim=-1, p=2.0)
+        current_obs = obs_history[:, :self.num_one_step_obs]
+        actor_input = torch.cat((current_obs, vel, z), dim=-1)
+        return self.actor(actor_input)
     
 def get_activation(act_name):
     if act_name == "elu":

@@ -512,14 +512,14 @@ class RewardsCfg:
     #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["Head_.*"]),
     #     },
     # )
-    base_undesired_contacts = RewTerm(
-        func=mdp.undesired_contacts,
-        weight=-1.0, #-0.1, #-0.1,
-        params={
-            "threshold": 0.3,
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["base"]),
-        },
-    )
+    # base_undesired_contacts = RewTerm(
+    #     func=mdp.undesired_contacts,
+    #     weight=-1.0, #-0.1, #-0.1,
+    #     params={
+    #         "threshold": 0.3,
+    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["base"]),
+    #     },
+    # )
     
     other_undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
@@ -539,7 +539,7 @@ class RewardsCfg:
     #     },
     # )
 
-    # is_terminated = RewTerm(func=mdp.is_terminated, weight=-200.0)
+    is_terminated = RewTerm(func=mdp.is_terminated, weight=-200.0)
     joint_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-5.0)
     joint_vel_limits = RewTerm(func=mdp.joint_vel_limits, weight=-5.0, params={"soft_ratio": 0.9})
     #applied_torque_limits = RewTerm(func=mdp.applied_torque_limits, weight=-0.0001) #-1.0 #only works for explicit actuators
@@ -725,10 +725,18 @@ class TerminationsCfg:
     """Termination terms for the MDP."""
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    # base_contact = DoneTerm(
-    #     func=mdp.illegal_contact,
-    #     params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
-    # )  
+    base_contact = DoneTerm(
+        func=mdp.illegal_contact,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
+    )  
+    # bad_orientation = DoneTerm(
+    #     func=mdp.bad_orientation,
+    #     params={"limit_angle": math.radians(65.0), "asset_cfg": SceneEntityCfg("robot")},
+    # )
+    # bad_base_height = DoneTerm(
+    #     func=mdp.root_height_below_minimum,
+    #     params={"minimum_height": 0.32, "asset_cfg": SceneEntityCfg("robot")},
+    # )
     terrain_out_of_bounds = DoneTerm(
         func=mdp.terrain_out_of_bounds,
         params={"asset_cfg": SceneEntityCfg("robot"), "distance_buffer": 3.0},
