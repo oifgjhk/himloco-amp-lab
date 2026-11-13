@@ -1,3 +1,4 @@
+# 完整替换 source/himloco_lab/rsl_rl/modules/him_estimator.py
 import copy
 import math
 import torch
@@ -9,20 +10,24 @@ from torch.distributions import Normal, Categorical
 
 
 class HIMEstimator(nn.Module):
-    def __init__(self,
-                 temporal_steps,
-                 num_one_step_obs,
-                 enc_hidden_dims=[128, 64, 16],
-                 tar_hidden_dims=[128, 64],
-                 activation='elu',
-                 learning_rate=1e-3,
-                 max_grad_norm=10.0,
-                 num_prototype=32,
-                 temperature=3.0,
-                 **kwargs):
+    def __init__(
+        self,
+        temporal_steps,
+        num_one_step_obs,
+        enc_hidden_dims=[128, 64, 16],
+        tar_hidden_dims=[128, 64],
+        activation="elu",
+        learning_rate=1e-3,
+        max_grad_norm=10.0,
+        num_prototype=32,
+        temperature=3.0,
+        **kwargs,
+    ):
         if kwargs:
-            print("Estimator_CL.__init__ got unexpected arguments, which will be ignored: " + str(
-                [key for key in kwargs.keys()]))
+            print(
+                "Estimator_CL.__init__ got unexpected arguments, which will be ignored: "
+                + str([key for key in kwargs.keys()])
+            )
         super(HIMEstimator, self).__init__()
         activation = get_activation(activation)
 
@@ -73,16 +78,73 @@ class HIMEstimator(nn.Module):
         z = F.normalize(z, dim=-1, p=2)
         return vel, z
 
+    def encode_differentiable(self, obs_history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """BPTT 专用可微编码接口：不调用 .detach()，允许策略梯度穿透历史观测帧"""
+        parts = self.encoder(obs_history.float())
+        vel, z = parts[..., :3], parts[..., 3:]
+        z = F.normalize(z, dim=-1, p=2.0)
+        return vel, z
+
     def update(self, obs_history, next_critic_obs, lr=None):
         if lr is not None:
             self.learning_rate = lr
             for param_group in self.optimizer.param_groups:
-                param_group['lr'] = self.learning_rate
-                
-        vel = next_critic_obs[:, self.num_one_step_obs:self.num_one_step_obs+3].detach()
-        next_obs = next_critic_obs.detach()[:, 3:self.num_one_step_obs+3]
+                param_group["lr"] = self.learning_rate
+
+        vel = next_critic_obs[:, self.num_one_step_obs : self.num_one_step_obs + 3].detach()
+        next_obs = next_critic_obs.detach()[:, 3 : self.num_one_step_obs + 3]
 
         z_s = self.encoder(obs_history)
+        z_t = self.target(next_obs)
+        pred_vel, z_s = z_s[..., :3], z_s[..., 3:]
+
+        z_s = F.normalize(z_s, dim=-1, p=2)
+        z_t = F.normalize(z_t, dim=-1, p=2)
+
+        with torch.no_grad():
+            w = self.proto.weight.data.clone()
+            w = F.normalize(w, dim=-1, p=2)
+            self.proto.weight.copy_(w)
+
+        score_s = z_s @ self.proto.weight.T
+        score_t = z_t @ self.proto.weight.T
+
+        with torch.no_grad():
+            q_s = sinkhorn(score_s)
+            q_t = sinkhorn(score_t)
+
+        log_p_s = F.log_softmax(score_s / self.temperature, dim=-1)
+        log_p_t = F.log_softmax(score_t / self.temperature, dim=-1)
+
+        swap_loss = -0.5 * (q_s * log_p_t + q_t * log_p_s).mean()
+        estimation_loss = F.mse_loss(pred_vel, vel)
+        losses = estimation_loss + swap_loss
+
+        self.optimizer.zero_grad()
+        losses.backward()
+        nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)
+        self.optimizer.step()
+
+        return estimation_loss.item(), swap_loss.item()
+
+    def update_from_wm_replay(
+        self,
+        obs_history: torch.Tensor,
+        next_obs_history: torch.Tensor,
+        next_base_lin_vel_b: torch.Tensor,
+        lr: float | None = None,
+    ) -> tuple[float, float]:
+        """BPTT 模式下使用 WMReplayBuffer 真实物理转移更新 HIMEstimator"""
+        if lr is not None:
+            self.learning_rate = lr
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = self.learning_rate
+
+        vel = (next_base_lin_vel_b.detach() * 2.0).float()
+        next_single_obs = next_obs_history[:, : self.num_one_step_obs].detach().float()
+        next_obs = torch.cat([next_single_obs[:, 3:], vel], dim=-1)
+
+        z_s = self.encoder(obs_history.detach().float())
         z_t = self.target(next_obs)
         pred_vel, z_s = z_s[..., :3], z_s[..., 3:]
 
@@ -123,11 +185,8 @@ def sinkhorn(out, eps=0.05, iters=3):
     Q /= Q.sum()
 
     for it in range(iters):
-        # normalize each row: total weight per prototype must be 1/K
         Q /= torch.sum(Q, dim=1, keepdim=True)
         Q /= K
-
-        # normalize each column: total weight per sample must be 1/B
         Q /= torch.sum(Q, dim=0, keepdim=True)
         Q /= B
     return (Q * B).T
@@ -153,10 +212,3 @@ def get_activation(act_name):
     else:
         print("invalid activation function!")
         return None
-
-def encode_differentiable(self, obs_history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """BPTT 专用可微编码接口：不调用 .detach()，允许策略梯度穿透历史观测帧"""
-    parts = self.encoder(obs_history.float())
-    vel, z = parts[..., :3], parts[..., 3:]
-    z = F.normalize(z, dim=-1, p=2.0)
-    return vel, z

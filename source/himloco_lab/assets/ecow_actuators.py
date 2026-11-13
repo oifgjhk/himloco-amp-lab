@@ -140,8 +140,8 @@ class EcowActuatorCfg(IdealPDActuatorCfg):
 class EcowActuatorCfg_HIP(EcowActuatorCfg):
     X1 = 6.96386
     X2 = 12.8805
-    Y1 = 1500 # 854
-    Y2 = 1500 # 854
+    Y1 = 854 #1500 # 854
+    Y2 = 854 #1500 # 854
     armature = 1.103652102
     min_delay = 0
     max_delay = 5
@@ -151,8 +151,8 @@ class EcowActuatorCfg_HIP(EcowActuatorCfg):
 class EcowActuatorCfg_THIGH(EcowActuatorCfg):
     X1 = 7.4351
     X2 = 13.823
-    Y1 = 1400 # 824
-    Y2 = 1400 # 824
+    Y1 = 824 #1400 # 824
+    Y2 = 824 #1400 # 824
     armature = 1.076606799
     min_delay = 0
     max_delay = 5
@@ -161,8 +161,8 @@ class EcowActuatorCfg_THIGH(EcowActuatorCfg):
 class EcowActuatorCfg_CALF(EcowActuatorCfg):
     X1 = 5.235988
     X2 = 9.686577
-    Y1 = 2000 # 1148
-    Y2 = 2000 # 1148
+    Y1 = 1148 #2000 # 1148
+    Y2 = 1148 #2000 # 1148
     armature = 2.00462812
     min_delay = 0
     max_delay = 5

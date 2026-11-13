@@ -53,37 +53,22 @@ class UniformLevelVelocityCommand(UniformVelocityCommand):
             terrain_gen_cfg = env.scene.terrain.cfg.terrain_generator
             sub_terrains_cfg = terrain_gen_cfg.sub_terrains
             sub_terrain_names = list(sub_terrains_cfg.keys())
-
-            # terrain_types 的真实取值上界 = 网格列数
             num_terrain_types = int(terrain_gen_cfg.num_cols)
 
-            # ---------- 1. 按 proportion 计算每一列 (terrain_type) 对应的 sub_terrain ----------
+            # 严格对齐 Isaac Lab TerrainGenerator 的 np.cumsum 列分配规则
             proportions = np.array(
                 [sub_terrains_cfg[name].proportion for name in sub_terrain_names],
                 dtype=np.float64,
             )
-            proportions = proportions / proportions.sum()          # 归一化，保证总和为 1
-            target_cols = proportions * num_terrain_types          # 期望列数（浮点）
+            proportions = proportions / proportions.sum()
+            cumsum_props = np.cumsum(proportions)
 
-            # 整数化：先向下取整，再把剩余的列补给“小数部分最大”的 sub_terrain
-            num_cols_per_terrain = np.floor(target_cols).astype(int)
-            remainder = target_cols - num_cols_per_terrain
-            remaining = num_terrain_types - num_cols_per_terrain.sum()
-            if remaining > 0:
-                top_idx = np.argsort(-remainder)[:remaining]
-                num_cols_per_terrain[top_idx] += 1
-
-            # 构建 terrain_type -> sub_terrain_name 的映射表（长度 = num_terrain_types）
             terrain_type_to_name: list[str] = []
-            for name, n in zip(sub_terrain_names, num_cols_per_terrain):
-                terrain_type_to_name.extend([name] * int(n))
+            for col_idx in range(num_terrain_types):
+                sub_idx = int(np.min(np.where(col_idx / num_terrain_types + 0.001 < cumsum_props)[0]))
+                terrain_type_to_name.append(sub_terrain_names[sub_idx])
 
-            # 保险：万一个别版本分配策略略有差异，长度不足时用最后一种补全
-            while len(terrain_type_to_name) < num_terrain_types:
-                terrain_type_to_name.append(sub_terrain_names[-1])
-
-            # ---------- 2. 用真实上界初始化张量 ----------
-            self.terrain_vel_limits  = torch.zeros((num_terrain_types, 2), device=self.device)
+            self.terrain_vel_limits = torch.zeros((num_terrain_types, 2), device=self.device)
             self.terrain_vel_current = torch.zeros((num_terrain_types, 2), device=self.device)
 
             for terrain_type, terrain_name in enumerate(terrain_type_to_name):
@@ -92,8 +77,6 @@ class UniformLevelVelocityCommand(UniformVelocityCommand):
                 )
                 self.terrain_vel_limits[terrain_type, 0] = limit[0]
                 self.terrain_vel_limits[terrain_type, 1] = limit[1]
-
-                # 当前等级从基础范围开始
                 self.terrain_vel_current[terrain_type, 0] = self.cfg.ranges.lin_vel_x[0]
                 self.terrain_vel_current[terrain_type, 1] = self.cfg.ranges.lin_vel_x[1]
 
@@ -101,9 +84,13 @@ class UniformLevelVelocityCommand(UniformVelocityCommand):
                     f"[terrain_type {terrain_type:2d}] {terrain_name:>22s} "
                     f"limit = [{limit[0]:.2f}, {limit[1]:.2f}]"
                 )
-        #记录单局内机器人的历史最大移动距离 & 速度指令矢量累加
+
+        # 记录单局内机器人的历史最大移动距离 & 速度指令矢量累加
         self.max_move_distance = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.commands_xy_accumulation = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device)
+        # 新增：记录每个环境最近完整回合的速度追踪奖励率 EMA（供课程升级稳定评估）
+        self.episode_track_rew_ema = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.episode_completed_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # 计算有效地形边长（用于动态重采样下界计算）
         terrain_cfg = self._env.scene.terrain.cfg
@@ -137,89 +124,110 @@ class UniformLevelVelocityCommand(UniformVelocityCommand):
             env_ids_tensor = torch.tensor(env_ids, device=self.device, dtype=torch.long)
         else:
             env_ids_tensor = env_ids.to(device=self.device, dtype=torch.long)
-        # sample velocity commands
+        if len(env_ids_tensor) == 0:
+            return
+
         r = torch.empty(len(env_ids_tensor), device=self.device)
         self.vel_command_b[env_ids_tensor, 0] = r.uniform_(*self.cfg.low_vel_env_lin_x_ranges)
         self.vel_command_b[env_ids_tensor, 1] = r.uniform_(*self.cfg.ranges.lin_vel_y)
         self.vel_command_b[env_ids_tensor, 2] = r.uniform_(*self.cfg.ranges.ang_vel_z)
-        
+
         if self.cfg.heading_command:
             self.heading_target[env_ids_tensor] = r.uniform_(*self.cfg.ranges.heading)
             self.is_heading_env[env_ids_tensor] = r.uniform_(0.0, 1.0) <= self.cfg.rel_heading_envs
-        
-        # high_vel_threshold = int(self.num_envs * self.cfg.rel_high_vel_envs)
-        # high_vel_mask = (env_ids_tensor <= high_vel_threshold)
-        # high_vel_env_ids = env_ids_tensor[high_vel_mask]
+
         self.is_high_vel_env[env_ids_tensor] = r.uniform_(0.0, 1.0) <= self.cfg.rel_high_vel_envs
         high_vel_mask = self.is_high_vel_env[env_ids_tensor]
         high_vel_env_ids = env_ids_tensor[high_vel_mask]
-        
-        # 核心修改：利用张量切片精准映射高速组环境的速度范围
-        if self.has_terrain:
-            env_terrain_types = self.env.scene.terrain.terrain_types[high_vel_env_ids].long()
-            current_ranges = self.terrain_vel_current[env_terrain_types]
-            
-            # 使用公式 v = min + r * (max - min) 进行对应地形的张量化均匀采样
-            r_high = torch.rand(len(high_vel_env_ids), device=self.device)
-            sampled_vels = current_ranges[:, 0] + r_high * (current_ranges[:, 1] - current_ranges[:, 0])
-            self.vel_command_b[high_vel_env_ids, 0] = sampled_vels
-        else:
-            r_high = torch.empty(len(high_vel_env_ids), device=self.device)
-            self.vel_command_b[high_vel_env_ids, 0] = r_high.uniform_(*self.cfg.ranges.lin_vel_x)
+
+        # 为每个重采样环境保存其对应的 vx 课程上下限
+        env_cfg_min = torch.full((len(env_ids_tensor),), self.cfg.low_vel_env_lin_x_ranges[0], device=self.device)
+        env_cfg_max = torch.full((len(env_ids_tensor),), self.cfg.low_vel_env_lin_x_ranges[1], device=self.device)
+
+        if len(high_vel_env_ids) > 0:
+            if self.has_terrain:
+                env_terrain_types = self.env.scene.terrain.terrain_types[high_vel_env_ids].long()
+                current_ranges = self.terrain_vel_current[env_terrain_types]
+                r_high = torch.rand(len(high_vel_env_ids), device=self.device)
+                sampled_vels = current_ranges[:, 0] + r_high * (current_ranges[:, 1] - current_ranges[:, 0])
+                self.vel_command_b[high_vel_env_ids, 0] = sampled_vels
+                env_cfg_min[high_vel_mask] = current_ranges[:, 0]
+                env_cfg_max[high_vel_mask] = current_ranges[:, 1]
+            else:
+                r_high = torch.empty(len(high_vel_env_ids), device=self.device)
+                self.vel_command_b[high_vel_env_ids, 0] = r_high.uniform_(*self.cfg.ranges.lin_vel_x)
+                env_cfg_min[high_vel_mask] = self.cfg.ranges.lin_vel_x[0]
+                env_cfg_max[high_vel_mask] = self.cfg.ranges.lin_vel_x[1]
 
         low_vel_x_min = self.cfg.low_vel_env_lin_x_ranges[0]
         low_vel_x_max = self.cfg.low_vel_env_lin_x_ranges[1]
-        in_low_vel_range = (self.vel_command_b[high_vel_env_ids, 0:1] >= low_vel_x_min) & \
-                            (self.vel_command_b[high_vel_env_ids, 0:1] <= low_vel_x_max)
+        in_low_vel_range = (self.vel_command_b[high_vel_env_ids, 0:1] >= low_vel_x_min) & (
+            self.vel_command_b[high_vel_env_ids, 0:1] <= low_vel_x_max
+        )
         self.vel_command_b[high_vel_env_ids, 1:2] *= in_low_vel_range
 
         if self.cfg.straight_target_prob > 0.0:
             self.is_straight_env[env_ids_tensor] = r.uniform_(0.0, 1.0) <= self.cfg.straight_target_prob
-        
         if self.cfg.rotation_target_prob > 0.0:
             self.is_rotation_env[env_ids_tensor] = r.uniform_(0.0, 1.0) <= self.cfg.rotation_target_prob
-        
         if self.cfg.lateral_target_prob > 0.0:
             self.is_lateral_env[env_ids_tensor] = r.uniform_(0.0, 1.0) <= self.cfg.lateral_target_prob
-        
         if self.cfg.rel_standing_envs > 0.0:
             self.is_standing_env[env_ids_tensor] = r.uniform_(0.0, 1.0) <= self.cfg.rel_standing_envs
 
-        # set small commands to zero
-        self.vel_command_b[env_ids_tensor, :2] *= (torch.norm(self.vel_command_b[env_ids_tensor, :2], dim=1) > \
-                                            self.cfg.min_command_norm).unsqueeze(1)
-        self.vel_command_b[env_ids_tensor, 2] *= (torch.abs(self.vel_command_b[env_ids_tensor, 2]) > \
-                                            self.cfg.min_command_norm)
-        # 若开启 dynamic_resample_commands 且在地形生成器模式下，
-        # 对非静止、非纯旋转环境的 X 轴速度应用 sample_disjoint_intervals，确保剩余时间内速度足够走出地形
+        # 立即应用姿态模式置零，防止后续 dynamic_resample 和 commands_xy_accumulation 累加虚假指令
+        lat_mask = self.is_lateral_env[env_ids_tensor]
+        rot_mask = self.is_rotation_env[env_ids_tensor]
+        str_mask = self.is_straight_env[env_ids_tensor]
+        std_mask = self.is_standing_env[env_ids_tensor]
+
+        self.vel_command_b[env_ids_tensor[lat_mask], 0] = 0.0
+        self.vel_command_b[env_ids_tensor[lat_mask], 2] = 0.0
+        self.vel_command_b[env_ids_tensor[rot_mask], 0:2] = 0.0
+        self.vel_command_b[env_ids_tensor[str_mask], 1:3] = 0.0
+        self.vel_command_b[env_ids_tensor[std_mask], :] = 0.0
+
+        # 死区过滤
+        self.vel_command_b[env_ids_tensor, :2] *= (
+            torch.norm(self.vel_command_b[env_ids_tensor, :2], dim=1) > self.cfg.min_command_norm
+        ).unsqueeze(1)
+        self.vel_command_b[env_ids_tensor, 2] *= (
+            torch.abs(self.vel_command_b[env_ids_tensor, 2]) > self.cfg.min_command_norm
+        )
+
+        # 修复后的动态下界采样：仅对非静止、非纯旋转、非纯侧移的【高速组】环境使用正确的 env_cfg_min/max
         if getattr(self.cfg, "dynamic_resample_commands", False) and self.terrain_length > 0.0:
             mean_resample_dt = 0.5 * (self.cfg.resampling_time_range[0] + self.cfg.resampling_time_range[1])
             remaining_dist = torch.clip(
-                0.625 * self.terrain_length - torch.norm(self.commands_xy_accumulation[env_ids], dim=1) * mean_resample_dt,
+                0.5 * self.terrain_length
+                - torch.norm(self.commands_xy_accumulation[env_ids_tensor], dim=1) * mean_resample_dt,
                 min=0.0,
             )
-            rem_steps = (self._env.max_episode_length - self._env.episode_length_buf[env_ids] + 1).clamp(min=1)
+            rem_steps = (self._env.max_episode_length - self._env.episode_length_buf[env_ids_tensor] + 1).clamp(min=1)
             vel_low_bound = torch.clip(remaining_dist / (rem_steps * self._env.step_dt + 1e-9), min=0.0)
 
-            # 仅对有线速度需求的环境（非 standing 且当前 vx != 0）应用下界约束
-            active_vx_mask = (~self.is_standing_env[env_ids]) & (torch.abs(self.vel_command_b[env_ids, 0]) > 1e-3)
-            active_ids = env_ids[active_vx_mask]
+            active_vx_mask = (
+                high_vel_mask
+                & (~std_mask)
+                & (~rot_mask)
+                & (~lat_mask)
+                & (torch.abs(self.vel_command_b[env_ids_tensor, 0]) > 1e-3)
+            )
+            active_ids = env_ids_tensor[active_vx_mask]
             if len(active_ids) > 0:
-                # 获取这些环境当前允许的 vx 上下限（若已有 terrain_vel_current 则取对应范围，否则取 cfg.ranges.lin_vel_x）
-                if hasattr(self, "env_lin_x_ranges"):
-                    cfg_min = self.env_lin_x_ranges[active_ids, 0]
-                    cfg_max = self.env_lin_x_ranges[active_ids, 1]
-                else:
-                    cfg_min = torch.full((len(active_ids),), self.cfg.ranges.lin_vel_x[0], device=self.device)
-                    cfg_max = torch.full((len(active_ids),), self.cfg.ranges.lin_vel_x[1], device=self.device)
-
-                bound = torch.minimum(vel_low_bound[active_vx_mask], 0.8 * torch.maximum(cfg_max.abs(), cfg_min.abs()))
+                cfg_min = env_cfg_min[active_vx_mask]
+                cfg_max = env_cfg_max[active_vx_mask]
+                bound = torch.minimum(vel_low_bound[active_vx_mask], 0.6 * torch.maximum(cfg_max.abs(), cfg_min.abs()))
                 self.vel_command_b[active_ids, 0] = sample_disjoint_intervals(
                     active_ids, bound, cfg_min, cfg_max, self.device
                 )
+                # 速度超过低速区间时清零侧向速度 vy，防止斜坡高速大侧移摔倒
+                high_vx = (self.vel_command_b[active_ids, 0] < low_vel_x_min) | (
+                    self.vel_command_b[active_ids, 0] > low_vel_x_max
+                )
+                self.vel_command_b[active_ids[high_vx], 1] = 0.0
 
-        # 4. 新增：累加每次重采样后的 XY 平面速度指令矢量（静止环境已为 0）
-        self.commands_xy_accumulation[env_ids] += self.vel_command_b[env_ids, :2]
+        self.commands_xy_accumulation[env_ids_tensor] += self.vel_command_b[env_ids_tensor, :2]
         
     def _update_command(self):
         """Post-processes the velocity command.

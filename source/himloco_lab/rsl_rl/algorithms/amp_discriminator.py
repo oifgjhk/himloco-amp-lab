@@ -90,3 +90,26 @@ class AMPDiscriminator(nn.Module):
         r = (1.0 - self.task_reward_lerp) * disc_r + self.task_reward_lerp * task_r
         # r = disc_r +  task_r
         return r
+    
+    def compute_differentiable_amp_reward(
+        self,
+        state: torch.Tensor,
+        next_state: torch.Tensor,
+        task_reward: torch.Tensor,
+        normalizer: object | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """BPTT 想象滚动专用的可微 AMP 风格奖励与任务奖励融合函数（不调用 torch.no_grad）"""
+        if normalizer is not None:
+            mean_t = torch.as_tensor(normalizer.mean, device=self.device, dtype=state.dtype)
+            std_t = torch.sqrt(torch.as_tensor(normalizer.var + normalizer.epsilon, device=self.device, dtype=state.dtype))
+            clip_val = float(getattr(normalizer, "clip_obs", 10.0))
+            state = torch.clamp((state - mean_t) / std_t, -clip_val, clip_val)
+            next_state = torch.clamp((next_state - mean_t) / std_t, -clip_val, clip_val)
+
+        d = self.amp_linear(self.trunk(torch.cat([state, next_state], dim=-1))).squeeze(-1)
+        style_reward = self.amp_reward_coef * torch.clamp(1.0 - 0.25 * torch.square(d - 1.0), min=0.0)
+        if self.task_reward_lerp > 0:
+            reward = (1.0 - self.task_reward_lerp) * style_reward + self.task_reward_lerp * task_reward
+        else:
+            reward = style_reward
+        return reward, d

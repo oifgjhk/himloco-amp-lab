@@ -101,14 +101,14 @@ COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
     sub_terrains={
         # "pyramid_stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
         #     proportion=0.1,
-        #     step_height_range=(0.05, 0.50),  # 0.05 + 0.18 * difficulty
+        #     step_height_range=(0.07, 0.18),  # 0.05 + 0.18 * difficulty
         #     step_width=0.30, 
-        #     platform_width=6.0, 
+        #     platform_width=4.0, 
         #     border_width=0.0,  
         # ),
         # "pyramid_stairs_inv": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
-        #     proportion=1.0,
-        #     step_height_range=(0.05, 0.30),   #0.23
+        #     proportion=0.15,
+        #     step_height_range=(0.07, 0.18),   #0.23
         #     step_width=0.30,
         #     platform_width=4.0,
         #     border_width=0.0,  
@@ -127,27 +127,28 @@ COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
         #     platform_width=3.0,
         #     border_width=0.0,  
         # ),
-        "hf_pyramid_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
-            proportion=0.05, 
-            slope_range=(0.0, 0.6),  
-            platform_width=4.0,  
-            border_width=0.0,
-        ),
-        "hf_pyramid_slope_inv": terrain_gen.HfInvertedPyramidSlopedTerrainCfg(
-            proportion=0.05, 
-            slope_range=(0.0, 0.6),  
-            platform_width=4.0,
-            border_width=0.0,  
-        ),
-        "hf_slope_with_noise": him_terrains.HfPyramidSlopeWithNoiseCfg(
-            proportion=0.05,
-            slope_range=(0.0, 0.6),
-            platform_width=4.0,
-            border_width=0.0,
-            noise_amplitude_range=(0.01, 0.08),
-            noise_step=0.005,
-            downsampled_scale=0.2,
-        ),
+        # "hf_pyramid_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+        #     proportion=0.05, 
+        #     slope_range=(0.0, 0.9),  
+        #     platform_width=4.0,  
+        #     border_width=0.0,
+        # ),
+        # "hf_pyramid_slope_inv": terrain_gen.HfInvertedPyramidSlopedTerrainCfg(
+        #     proportion=0.05, 
+        #     slope_range=(0.0, 0.9),  
+        #     platform_width=4.0,
+        #     border_width=0.0,  
+        # ),
+        # "hf_slope_inv_with_noise": him_terrains.HfPyramidSlopeWithNoiseCfg(
+        #     proportion=0.05,
+        #     slope_range=(0.0, 0.9),
+        #     platform_width=4.0,
+        #     border_width=0.0,
+        #     noise_amplitude_range=(0.01, 0.08),
+        #     noise_step=0.005,
+        #     downsampled_scale=0.2,
+        #     inverted=True,
+        # ),
         # "discrete_obstacles": him_terrains.HfDiscreteObstaclesTerrainCfg(
         #     proportion=0.05,
         #     max_height_range=(0.05, 1.2),  # 0.05 + 0.1 * difficulty
@@ -170,10 +171,10 @@ COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
         #     # 波浪数量
         #     num_waves=5.0
         # ),
-        # # flat地形
-        # "flat": terrain_gen.MeshPlaneTerrainCfg(
-        #     proportion=0.1,
-        # ),
+        # flat地形
+        "flat": terrain_gen.MeshPlaneTerrainCfg(
+            proportion=0.1,
+        ),
     },
 )
 
@@ -231,7 +232,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: HIMOnPolicyRunnerCfg):
     #env_cfg.scene.terrain.terrain_type = "plane"
     env_cfg.scene.terrain.terrain_generator = COBBLESTONE_ROAD_CFG
     #env_cfg.curriculum.terrain_levels = None
-
+    env_cfg.events.physics_material.static_friction_range=(1.0, 1.0)
+    env_cfg.events.physics_material.dynamic_friction_range=(1.0, 1.0)
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)

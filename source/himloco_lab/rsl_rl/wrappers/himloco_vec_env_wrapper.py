@@ -502,7 +502,16 @@ class HimlocoVecEnvWrapper(VecEnv):
         snapshot = getattr(self.unwrapped, "terminal_physics_snapshot", None)
         if snapshot is not None:
             reset_ids, term_state = snapshot
-            next_state[reset_ids] = term_state
+            if not isinstance(reset_ids, torch.Tensor):
+                reset_ids = torch.tensor(reset_ids, dtype=torch.long, device=next_state.device)
+            else:
+                reset_ids = reset_ids.view(-1).to(device=next_state.device, dtype=torch.long)
+            if reset_ids.numel() > 0:
+                term_state = term_state.to(next_state.device)
+                if term_state.shape[0] == next_state.shape[0] and reset_ids.shape[0] != next_state.shape[0]:
+                    next_state[reset_ids] = term_state[reset_ids]
+                else:
+                    next_state[reset_ids] = term_state
         return next_state
 
     def get_velocity_commands(self) -> torch.Tensor:

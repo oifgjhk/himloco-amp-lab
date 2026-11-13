@@ -1,3 +1,4 @@
+# 完整替换 source/himloco_lab/rsl_rl/modules/world_model.py
 # Copyright (c) 2025, HimLoco Lab Project Developers.
 # Reference: SuperMimic (supermimic/core/world_model.py, state.py, rotations.py, imagination.py, velocity.py)
 
@@ -250,6 +251,14 @@ class WorldModel(nn.Module):
         # 任务头预测: [reward(1), death_logit(1)]
         self.task_head = nn.Linear(width, 2)
 
+        # 机体系四足位置可微运动学网络 (q -> foot_pos_b, 12 -> 12)
+        self.foot_pos_net = nn.Sequential(
+            nn.Linear(joints, 128),
+            nn.SiLU(),
+            nn.Linear(128, 12),
+        )
+        self.foot_pos_norm = RunningNorm(12, eps=1e-2)
+
         # 关键初始化：动力学增量头与任务头置零，保证初始多步滚动稳定
         nn.init.zeros_(self.dynamics.weight)
         nn.init.zeros_(self.dynamics.bias)
@@ -281,6 +290,7 @@ class WorldModel(nn.Module):
         action: torch.Tensor,
         reward: torch.Tensor | None = None,
         valid_mask: torch.Tensor | None = None,
+        amp_obs: torch.Tensor | None = None,
     ):
         if valid_mask is not None and valid_mask.any():
             state = state[valid_mask]
@@ -288,10 +298,17 @@ class WorldModel(nn.Module):
             action = action[valid_mask]
             if reward is not None:
                 reward = reward[valid_mask]
+            if amp_obs is not None:
+                amp_obs = amp_obs[valid_mask]
+        elif valid_mask is not None and not valid_mask.any():
+            return
+
         self.input_norm.update(self.inputs(state, action))
         self.output_norm.update(state_delta(state, next_state, self.joints))
         if reward is not None and reward.numel() > 0:
             self.reward_norm.update(reward.unsqueeze(-1))
+        if amp_obs is not None and amp_obs.numel() > 0 and amp_obs.shape[-1] >= 24:
+            self.foot_pos_norm.update(amp_obs[..., 12:24])
 
     def error_scale(self) -> torch.Tensor:
         floor = self.output_norm.mean.new_tensor(
@@ -303,7 +320,7 @@ class WorldModel(nn.Module):
     def predict(self, state: torch.Tensor, action: torch.Tensor):
         x = self.input_norm(self.inputs(state, action))
         hidden = self.trunk(x)
-        inc_norm = self.dynamics(hidden)
+        inc_norm = torch.clamp(self.dynamics(hidden), -15.0, 15.0)
         contact_logits = self.contact(hidden)
         task_out = self.task_head(hidden)
 
@@ -322,15 +339,7 @@ class WorldModel(nn.Module):
         action: torch.Tensor,
         command: torch.Tensor,
     ) -> torch.Tensor:
-        """从预测物理状态解析构建 Ecow 的 45 维单帧观测 (完全可微)
-        严格对应 ecow/velocity_env_cfg.py 中 PolicyCfg 的顺序与 scale:
-        1. velocity_commands (3, scale=1.0)
-        2. base_ang_vel (3, scale=0.25)
-        3. projected_gravity (3, scale=1.0)
-        4. joint_pos_rel (12, scale=1.0)
-        5. joint_vel_rel (12, scale=0.05)
-        6. last_action (12, scale=1.0)
-        """
+        """从预测物理状态解析构建 Ecow 的 45 维单帧观测 (完全可微)"""
         pos, quat, _, ang_vel_w, q, dq = unpack_state(next_state, self.joints)
         R = quat_to_mat(quat)
         Rt = R.transpose(-1, -2)
@@ -348,17 +357,22 @@ class WorldModel(nn.Module):
         )
         return torch.clamp(frame, -100.0, 100.0)
 
+    def predict_foot_pos_b(self, q: torch.Tensor) -> torch.Tensor:
+        """从关节角 q 可微预测机体系下的四足位置 foot_pos_b (12维)"""
+        raw = self.foot_pos_net(q - self.q0)
+        return raw * self.foot_pos_norm.std() + self.foot_pos_norm.mean
+
     def build_amp_obs(self, state: torch.Tensor) -> torch.Tensor:
-        """从物理状态构建可微 AMP 观测特征，供判别器在 BPTT 滚动中计算风格奖励梯度"""
-        pos, quat, lin_vel_w, ang_vel_w, q, dq = unpack_state(state, self.joints)
+        """从 37 维物理状态构建严格对齐 AMPLoader 的 42 维可微 AMP 观测特征:
+        [joint_pos(12), foot_pos_b(12), base_lin_vel_b(3), base_ang_vel_b(3), joint_vel(12)]
+        """
+        _, quat, lin_vel_w, ang_vel_w, q, dq = unpack_state(state, self.joints)
         R = quat_to_mat(quat)
         Rt = R.transpose(-1, -2)
         lin_vel_b = mv(Rt, lin_vel_w)
         ang_vel_b = mv(Rt, ang_vel_w)
-        gravity_w = torch.zeros_like(pos)
-        gravity_w[..., 2] = -1.0
-        proj_grav_b = mv(Rt, gravity_w)
-        return torch.cat((q, dq, lin_vel_b, ang_vel_b, proj_grav_b, pos[..., 2:3]), dim=-1)
+        foot_pos_b = self.predict_foot_pos_b(q)
+        return torch.cat((q, foot_pos_b, lin_vel_b, ang_vel_b, dq), dim=-1)
 
     def compute_differentiable_reward_and_continuation(
         self,
@@ -371,7 +385,7 @@ class WorldModel(nn.Module):
         pred_reward: torch.Tensor,
         death_logit: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """对齐 supermimic/mdp/velocity.py, recovery.py 与 ecow/velocity_env_cfg.py 的可微奖励与软存活函数"""
+        """对齐 supermimic 与 ecow/velocity_env_cfg.py 的可微奖励与软存活函数"""
         _, _, _, _, _, old_dq = unpack_state(state, self.joints)
         pos, quat, lin_vel_w, ang_vel_w, q, dq = unpack_state(next_state, self.joints)
         R = quat_to_mat(quat)
@@ -381,11 +395,11 @@ class WorldModel(nn.Module):
         # 1. 线速度与角速度跟踪 (对齐 ecow/velocity_env_cfg.py: weight=2.0/1.0, std^2=0.1)
         lin_vel_local = mv(R_yaw.transpose(-1, -2), lin_vel_w)
         lin_err = (lin_vel_local[..., :2] - command[..., :2]).square().sum(-1)
-        rew_lin_vel = 2.0 * torch.exp(-lin_err / 0.1)
+        rew_lin_vel = 2.0 * torch.exp(-torch.clamp(lin_err / 0.1, max=20.0))
 
         ang_vel_b = mv(Rt, ang_vel_w)
         ang_err = (ang_vel_b[..., 2] - command[..., 2]).square()
-        rew_ang_vel = 1.0 * torch.exp(-ang_err / 0.1)
+        rew_ang_vel = 1.0 * torch.exp(-torch.clamp(ang_err / 0.1, max=20.0))
 
         # 2. 机身姿态、垂直速度与横滚俯仰角速度惩罚
         gravity_w = torch.zeros_like(pos)
@@ -398,10 +412,10 @@ class WorldModel(nn.Module):
         pen_flat_ori = -0.5 * proj_grav_b[..., :2].square().sum(-1)
         pen_adapt_ori = -0.3 * (proj_grav_b[..., 1].square() + 0.2 * proj_grav_b[..., 0].square())
 
-        # 3. 机身标称高度保持 (引导 ecow 稳定站立，防止趴地)
-        rew_height = 0.5 * torch.exp(-(pos[..., 2] - self.nominal_height).square() / (0.08 ** 2))
+        # 3. 机身标称高度保持
+        rew_height = 0.5 * torch.exp(-torch.clamp((pos[..., 2] - self.nominal_height).square() / (0.08 ** 2), max=20.0))
 
-        # 4. 动作平滑度、二阶差分、关节加速度、关节速度与软限位惩罚 (防止 BPTT 梯度攻击的核心正则项)
+        # 4. 动作平滑度、二阶差分、关节加速度、关节速度与软限位惩罚
         pen_action_rate = -0.01 * (action - prev_action).square().sum(-1)
         pen_smoothness = -0.01 * (action - 2.0 * prev_action + pre_pre_action).square().sum(-1)
         acc = (dq - old_dq) / self.dt
@@ -411,7 +425,7 @@ class WorldModel(nn.Module):
             (self.limits[:, 0] - q).clamp_min(0.0) + (q - self.limits[:, 1]).clamp_min(0.0)
         ).sum(-1)
 
-        # 5. 关节默认姿态正则 (对应 joint_pos 与 joint_pos_hip)
+        # 5. 关节默认姿态正则
         cmd_norm = torch.linalg.norm(command, dim=-1)
         alpha = torch.clamp(cmd_norm / 0.2, min=0.0, max=1.0)
         alpha = alpha * alpha * (3.0 - 2.0 * alpha)
@@ -444,7 +458,6 @@ class WorldModel(nn.Module):
             + pen_joint_pos
             + pen_termination
         )
-        # 80% 精确解析可微奖励 + 20% 学习的环境奖励头（兼顾解析梯度精度与触地/抬腿等复杂环境项）
         total_reward = 0.8 * analytic_step_reward + 0.2 * pred_reward
         return total_reward, continuation
 
@@ -464,23 +477,37 @@ def compute_wm_rollout_loss(model: WorldModel, window: dict[str, torch.Tensor]) 
         w = mask[:, t].float()
         denom = w.sum().clamp_min(1.0)
 
+        # 非终止步掩码：防止环境在 done=True 当步发生 Reset 后 next_state 跳变污染物理增量头
+        not_done = ~(window["terminated"][:, t] | window["truncated"][:, t])
+        phys_w = (mask[:, t] & not_done).float()
+        phys_denom = phys_w.sum().clamp_min(1.0)
+
         # 1. 局部状态增量 MSE
         err = state_delta(window["next_state"][:, t], state, model.joints) / scale
-        physics_losses.append((err.square().mean(-1) * w).sum() / denom)
+        physics_losses.append((err.square().mean(-1) * phys_w).sum() / phys_denom)
 
         # 2. 足端接触 BCE
         if "feet_contact" in window:
             c_loss = F.binary_cross_entropy_with_logits(
                 contact_logits, window["feet_contact"][:, t].float(), reduction="none"
             ).mean(-1)
-            contact_losses.append((c_loss * w).sum() / denom)
+            contact_losses.append((c_loss * phys_w).sum() / phys_denom)
 
-        # 3. 奖励 MSE 与终止 BCE
+        # 3. 奖励 MSE、终止 BCE 与足端局部位置 FK 监督损失
         rew_err = ((pred_rew - window["reward"][:, t]) / model.reward_norm.std()[0]).square()
         death_loss = F.binary_cross_entropy_with_logits(
             death_logit, window["terminated"][:, t].float(), reduction="none"
         )
-        aux_losses.append(((rew_err + death_loss) * w).sum() / denom)
+        step_aux = ((rew_err + death_loss) * w).sum() / denom
+
+        if "next_amp_obs" in window and window["next_amp_obs"].shape[-1] >= 24:
+            target_q = window["next_amp_obs"][:, t, :12]
+            target_foot_pos = window["next_amp_obs"][:, t, 12:24]
+            pred_foot_pos = model.predict_foot_pos_b(target_q)
+            foot_err = ((pred_foot_pos - target_foot_pos) / model.foot_pos_norm.std()).square().mean(-1)
+            step_aux = step_aux + (foot_err * w).sum() / denom
+
+        aux_losses.append(step_aux)
 
     p_loss = torch.stack(physics_losses).mean()
     c_loss = torch.stack(contact_losses).mean() if contact_losses else torch.zeros_like(p_loss)

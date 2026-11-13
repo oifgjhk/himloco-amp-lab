@@ -340,18 +340,22 @@ class AMPPPO:
         default_joint_pos: torch.Tensor | None = None,
         joint_limits: torch.Tensor | None = None,
         wm_width: int = 2048,
-        wm_lr: float = 2e-4,
-        actor_lr: float = 2e-4,
-        critic_lr: float = 2e-4,
+        wm_lr: float = 2.0e-4,
+        actor_lr: float = 2.0e-4,
+        critic_lr: float = 2.0e-4,
         horizon: int = 32,
         wm_buffer_steps: int = 256,
-        nominal_height: float = 0.78,
-        min_height: float = 0.35,
+        nominal_height: float = 0.72,
+        min_height: float = 0.32,
         max_tilt_deg: float = 65.0,
         dt: float = 0.02,
     ):
-        self.bptt_horizon = horizon
-        self.num_one_step_obs = num_one_step_obs
+        from ..modules.world_model import WorldModel, BPTTValueModel
+        from ..storage.wm_replay_buffer import WMReplayBuffer
+
+        self.bptt_horizon = int(horizon)
+        self.num_one_step_obs = int(num_one_step_obs)
+
         self.world_model = WorldModel(
             joints=num_joints,
             frame_dim=num_one_step_obs,
@@ -364,28 +368,44 @@ class AMPPPO:
             max_tilt_deg=max_tilt_deg,
             dt=dt,
         ).to(self.device)
-        self.bptt_critic = BPTTValueModel(self.world_model.inp_dim, command_dim=3).to(self.device)
-        self.wm_replay = WMReplayBuffer(wm_buffer_steps, num_envs, device=self.device)
 
-        self.wm_optimizer = optim.Adam(self.world_model.parameters(), lr=wm_lr)
-        self.bptt_actor_optimizer = optim.Adam(
+        self.bptt_critic = BPTTValueModel(wm_inp_dim=self.world_model.inp_dim, command_dim=3).to(self.device)
+        self.wm_replay = WMReplayBuffer(capacity=wm_buffer_steps, num_envs=num_envs, device=self.device)
+
+        self.wm_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=wm_lr)
+        self.bptt_actor_optimizer = torch.optim.Adam(
             self.actor_critic.actor.parameters(), lr=actor_lr, betas=(0.9, 0.95)
         )
-        self.bptt_critic_optimizer = optim.Adam(self.bptt_critic.parameters(), lr=critic_lr)
+        self.bptt_critic_optimizer = torch.optim.Adam(self.bptt_critic.parameters(), lr=critic_lr)
 
-    def update_world_model(self, wm_batches: int = 10, wm_batch_size: int = 2048) -> dict[str, float]:
+    def update_world_model(
+        self, wm_batches: int = 10, wm_batch_size: int = 2048, window_len: int = 8
+    ) -> dict[str, float]:
+        from ..modules.world_model import compute_wm_rollout_loss
+
         self.world_model.train()
-        metrics_accum: dict[str, float] = {}
+        tot_loss, phys_loss, cont_loss, aux_loss = 0.0, 0.0, 0.0, 0.0
+        actual_horizon = min(window_len, self.wm_replay.size)
         for _ in range(wm_batches):
-            window = self.wm_replay.sample_prefix(wm_batch_size, horizon=8)
-            self.wm_optimizer.zero_grad(set_to_none=True)
+            window = self.wm_replay.sample_prefix(batch_size=wm_batch_size, horizon=actual_horizon)
             loss, info = compute_wm_rollout_loss(self.world_model, window)
+            self.wm_optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            nn.utils.clip_grad_norm_(self.world_model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 1.0)
             self.wm_optimizer.step()
-            for k, v in info.items():
-                metrics_accum[k] = metrics_accum.get(k, 0.0) + float(v) / wm_batches
-        return metrics_accum
+
+            tot_loss += float(info["wm_loss"])
+            phys_loss += float(info["wm_physics_loss"])
+            cont_loss += float(info["wm_contact_loss"])
+            aux_loss += float(info["wm_aux_loss"])
+
+        n = max(wm_batches, 1)
+        return {
+            "wm_loss": tot_loss / n,
+            "wm_physics_loss": phys_loss / n,
+            "wm_contact_loss": cont_loss / n,
+            "wm_aux_loss": aux_loss / n,
+        }
 
     def update_bptt_step(
         self,
@@ -395,117 +415,139 @@ class AMPPPO:
         critic_epochs: int = 5,
         critic_minibatches: int = 4,
     ) -> dict[str, float]:
-        # 1. 更新世界模型 (8步自回归损失)
+        from ..modules.world_model import (
+            freeze_parameters,
+            critic_input,
+            update_bptt_critic,
+            unpack_state,
+            quat_to_mat,
+            mv,
+        )
+
+        # 1. 更新 8 步自回归世界模型
         wm_metrics = self.update_world_model(wm_batches=wm_batches, wm_batch_size=wm_batch_size)
 
-        # 2. 采样真实初始状态并监督更新 HIMEstimator
-        starts = self.wm_replay.sample_starts(batch_size)
-        if hasattr(self.actor_critic, "estimator") and hasattr(self.actor_critic.estimator, "update"):
-            try:
-                _, quat, lin_vel_w, _, _, _ = unpack_state(starts["state"], self.world_model.joints)
-                true_lin_vel_b = mv(quat_to_mat(quat).transpose(-1, -2), lin_vel_w) * 2.0
-                next_obs_step = (
-                    starts["next_obs_history"][:, : self.num_one_step_obs]
-                    if "next_obs_history" in starts
-                    else self.world_model.build_actor_frame(starts["state"], starts["action"], starts["command"])
+        # 2. 从 WMReplayBuffer 采样真实转移数据更新 HIMEstimator
+        starts = self.wm_replay.sample_starts(batch_size=batch_size)
+        est_loss_val, swap_loss_val = 0.0, 0.0
+        if "next_obs_history" in starts and "next_state" in starts:
+            _, next_quat, next_lin_vel_w, _, _, _ = unpack_state(starts["next_state"], self.world_model.joints)
+            next_Rt = quat_to_mat(next_quat).transpose(-1, -2)
+            next_lin_vel_b = mv(next_Rt, next_lin_vel_w)
+            if hasattr(self.actor_critic.estimator, "update_from_wm_replay"):
+                est_loss_val, swap_loss_val = self.actor_critic.estimator.update_from_wm_replay(
+                    starts["obs_history"], starts["next_obs_history"], next_lin_vel_b
                 )
-                next_critic_stub = torch.cat((next_obs_step, true_lin_vel_b), dim=-1)
-                est_loss, swap_loss = self.actor_critic.estimator.update(starts["obs_history"], next_critic_stub)
-                wm_metrics["estimator_loss"] = float(est_loss) + float(swap_loss)
-            except Exception:
-                wm_metrics["estimator_loss"] = 0.0
 
-        # 3. 32步可微想象滚动更新 Actor (冻结 WM, Critic, Estimator, Discriminator)
+        # 3. 冻结 WorldModel、Critic、Discriminator 与 Estimator 权重，执行 H=32 步可微想象 BPTT 更新 Actor
         state = starts["state"]
         obs_history = starts["obs_history"]
-        prev_action = starts["action"]
-        pre_pre_action = starts["prev_action"]
-        command = starts["command"]
+        prev_action = starts["prev_action"]
+        pre_pre_action = starts["pre_pre_action"]
+        command = starts["command"][:, :3]
 
-        critic_inputs, rewards, continuations = [], [], []
+        critic_inputs_list = []
+        rewards_list = []
+        continuations_list = []
 
+        self.actor_critic.actor.train()
         with freeze_parameters(
             self.world_model,
             self.bptt_critic,
-            getattr(self.actor_critic, "estimator", None),
             self.discriminator,
+            self.actor_critic.estimator,
         ):
             self.bptt_actor_optimizer.zero_grad(set_to_none=True)
-
             for _ in range(self.bptt_horizon):
-                critic_inputs.append(critic_input(self.world_model, state, prev_action, command))
+                critic_inputs_list.append(critic_input(self.world_model, state, prev_action, command))
 
-                if hasattr(self.actor_critic, "act_bptt"):
-                    action = self.actor_critic.act_bptt(obs_history)
-                else:
-                    action = self.actor_critic.act_inference(obs_history)
+                # 确定性可微策略前向
+                action = self.actor_critic.act_bptt(obs_history)
 
+                # 世界模型一步可微预测
                 next_state, _, pred_rew, death_logit = self.world_model.predict(state, action)
 
-                step_rew, cont = self.world_model.compute_differentiable_reward_and_continuation(
-                    state,
-                    next_state,
-                    action,
-                    prev_action,
-                    pre_pre_action,
-                    command,
-                    pred_rew,
-                    death_logit,
+                # 解析可微任务奖励与软存活率
+                task_rew, cont = self.world_model.compute_differentiable_reward_and_continuation(
+                    state=state,
+                    next_state=next_state,
+                    action=action,
+                    prev_action=prev_action,
+                    pre_pre_action=pre_pre_action,
+                    command=command,
+                    pred_reward=pred_rew,
+                    death_logit=death_logit,
                 )
 
-                # 构建下一时刻 45 维可微观测，并按 HimLoco 最新帧在最前 ([:, :45]) 滚动拼接
-                next_frame = self.world_model.build_actor_frame(next_state, action, command)
-                obs_history = torch.cat((next_frame, obs_history[:, : -self.num_one_step_obs]), dim=-1)
+                # 可微 42 维 AMP 观测与风格奖励融合
+                if self.discriminator is not None:
+                    amp_s = self.world_model.build_amp_obs(state)
+                    amp_ns = self.world_model.build_amp_obs(next_state)
+                    if hasattr(self.discriminator, "compute_differentiable_amp_reward"):
+                        step_rew, _ = self.discriminator.compute_differentiable_amp_reward(
+                            amp_s, amp_ns, task_rew, normalizer=self.amp_normalizer
+                        )
+                    else:
+                        step_rew = task_rew
+                else:
+                    step_rew = task_rew
 
-                rewards.append(step_rew)
-                continuations.append(cont)
+                # 构建下一时刻 45 维单步观测，并按 [最新帧在前, 历史帧在后] 推入 obs_history
+                next_frame = self.world_model.build_actor_frame(next_state, action, command)
+                if obs_history.shape[-1] > self.num_one_step_obs:
+                    obs_history = torch.cat((next_frame, obs_history[:, :-self.num_one_step_obs]), dim=-1)
+                else:
+                    obs_history = next_frame
+
+                rewards_list.append(step_rew)
+                continuations_list.append(cont)
+
                 pre_pre_action = prev_action
                 prev_action = action
                 state = next_state
 
-            critic_inputs.append(critic_input(self.world_model, state, prev_action, command))
-            c_in_stack = torch.stack(critic_inputs, dim=0)     # [H+1, B, D]
-            rew_stack = torch.stack(rewards, dim=0)            # [H, B]
-            cont_stack = torch.stack(continuations, dim=0)     # [H, B]
+            # 末端第 H+1 步的 Critic 输入与 Bootstrap 价值
+            critic_inputs_list.append(critic_input(self.world_model, state, prev_action, command))
+            critic_inputs = torch.stack(critic_inputs_list, dim=0)  # [H+1, B, D]
+            rewards = torch.stack(rewards_list, dim=0)              # [H, B]
+            continuations = torch.stack(continuations_list, dim=0)  # [H, B]
 
-            # 计算软存活累积权重与终端价值 Bootstrap (对齐 SuperMimic Eq. 2)
-            alive = torch.cumprod(cont_stack, dim=0)
+            # 对齐 SuperMimic 的累积存活率加权折扣回报 + H 步 Bootstrap
+            alive = torch.cumprod(continuations, dim=0)
             weights = torch.cat((torch.ones_like(alive[:1]), alive[:-1]), dim=0)
-            discounts = (
-                self.gamma ** torch.arange(self.bptt_horizon, device=state.device, dtype=state.dtype)
-            )[:, None]
+            discounts = (self.gamma ** torch.arange(self.bptt_horizon, device=self.device, dtype=rewards.dtype))[:, None]
+            imagined_return = (discounts * weights * rewards).sum(dim=0)
+            bootstrap_value = (self.gamma ** self.bptt_horizon) * alive[-1] * self.bptt_critic(critic_inputs[-1])
+            objective = (imagined_return + bootstrap_value).mean()
 
-            imagined_return = (discounts * weights * rew_stack).sum(dim=0)
-            bootstrap = (self.gamma ** self.bptt_horizon) * alive[-1] * self.bptt_critic(c_in_stack[-1])
-            objective = (imagined_return + bootstrap).mean()
-
-            (-objective).backward()
-            grad_norm = nn.utils.clip_grad_norm_(self.actor_critic.actor.parameters(), 1.0)
-            nn.utils.clip_grad_value_(self.actor_critic.actor.parameters(), 0.1)
+            actor_loss = -objective
+            actor_loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_critic.actor.parameters(), self.max_grad_norm)
+            torch.nn.utils.clip_grad_value_(self.actor_critic.actor.parameters(), 0.1)
             self.bptt_actor_optimizer.step()
 
-        # 4. 使用脱离计算图的想象轨迹更新 BPTT Critic (GAE 目标)
+        # 4. 使用脱离计算图的想象轨迹与 GAE 目标更新 BPTT Critic
         rollout_data = {
-            "critic_inputs": c_in_stack.detach(),
-            "rewards": rew_stack.detach(),
-            "continuations": cont_stack.detach(),
+            "critic_inputs": critic_inputs.detach(),
+            "rewards": rewards.detach(),
+            "continuations": continuations.detach(),
         }
-        v_loss = update_bptt_critic(
-            self.bptt_critic,
-            self.bptt_critic_optimizer,
-            rollout_data,
+        critic_loss = update_bptt_critic(
+            critic=self.bptt_critic,
+            optimizer=self.bptt_critic_optimizer,
+            rollout=rollout_data,
             epochs=critic_epochs,
             minibatches=critic_minibatches,
             gamma=self.gamma,
             lam=self.lam,
         )
 
-        wm_metrics.update(
-            {
-                "bptt_imagined_return": float(imagined_return.mean().detach()),
-                "bptt_critic_loss": float(v_loss),
-                "bptt_actor_grad_norm": float(grad_norm.detach()),
-                "bptt_survival_rate": float(alive[-1].mean().detach()),
-            }
-        )
-        return wm_metrics
+        return {
+            **wm_metrics,
+            "bptt_critic_loss": float(critic_loss.detach()),
+            "estimator_loss": float(est_loss_val),
+            "swap_loss": float(swap_loss_val),
+            "bptt_imagined_return": float(imagined_return.detach().mean()),
+            "bptt_survival_rate": float(alive[-1].detach().mean()),
+            "bptt_actor_grad_norm": float(grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else grad_norm),
+        }

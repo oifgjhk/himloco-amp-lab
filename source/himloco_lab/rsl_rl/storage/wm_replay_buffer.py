@@ -1,6 +1,4 @@
-# Copyright (c) 2025, HimLoco Lab Project Developers.
-# Adapted from SuperMimic (supermimic/core/replay.py)
-
+# 完整替换 source/himloco_lab/rsl_rl/storage/wm_replay_buffer.py
 from __future__ import annotations
 import torch
 
@@ -37,6 +35,7 @@ class WMReplayBuffer:
         terminated: torch.Tensor,
         truncated: torch.Tensor,
         feet_contact: torch.Tensor | None = None,
+        next_amp_obs: torch.Tensor | None = None,
     ):
         terminated = terminated.bool().view(self.num_envs)
         truncated = truncated.bool().view(self.num_envs)
@@ -56,6 +55,8 @@ class WMReplayBuffer:
         }
         if feet_contact is not None:
             values["feet_contact"] = feet_contact
+        if next_amp_obs is not None:
+            values["next_amp_obs"] = next_amp_obs
 
         if not self.storage:
             self.storage = {
@@ -64,7 +65,8 @@ class WMReplayBuffer:
             }
 
         for k, v in values.items():
-            self.storage[k][self.ptr].copy_(v.detach().to(self.device))
+            if k in self.storage:
+                self.storage[k][self.ptr].copy_(v.detach().to(self.device))
 
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.capacity, self.size + 1)
@@ -104,7 +106,6 @@ class WMReplayBuffer:
         mask = (preceding & (episodes == episodes[:, :1])).long().cumprod(dim=1).bool()
         out["_mask"] = mask
 
-        # 将 mask=False 的无效步替换为序列起始步，防止脏物理状态产生 NaN 梯度
         for k in list(out.keys()):
             if k.startswith("_"):
                 continue
@@ -138,5 +139,14 @@ class WMReplayBuffer:
         chosen_rows = self.rows(valid_age_idx[picks])
         chosen_envs = envs_pool[valid_env_col[picks]]
 
-        keys = ("state", "obs_history", "action", "prev_action", "pre_pre_action", "command")
+        keys = (
+            "state",
+            "next_state",
+            "obs_history",
+            "next_obs_history",
+            "action",
+            "prev_action",
+            "pre_pre_action",
+            "command",
+        )
         return {k: self.storage[k][chosen_rows, chosen_envs].clone() for k in keys if k in self.storage}

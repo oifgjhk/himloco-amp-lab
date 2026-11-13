@@ -9,7 +9,7 @@ from isaaclab.managers import SceneEntityCfg
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 def get_terrain_mapping(env: ManagerBasedRLEnv) -> tuple[list[str], list[str]]:
-    """解析地形配置，获取 sub_terrain_names 列表以及列索引 (terrain_type) 到名称的映射列表"""
+    """严格按照 Isaac Lab TerrainGenerator 的 np.cumsum 规则解析列索引到 sub_terrain 名称的映射"""
     if not (hasattr(env.scene, "terrain") and hasattr(env.scene.terrain, "cfg")):
         return [], []
 
@@ -22,37 +22,20 @@ def get_terrain_mapping(env: ManagerBasedRLEnv) -> tuple[list[str], list[str]]:
     sub_terrain_names = list(sub_terrains_cfg.keys())
     num_terrain_types = int(terrain_gen_cfg.num_cols)
 
-    # 按照比例计算每一列 (terrain_type) 对应的 sub_terrain (与 commands.py 分配规则完全一致)
     proportions = np.array(
         [sub_terrains_cfg[name].proportion for name in sub_terrain_names],
         dtype=np.float64,
     )
     proportions = proportions / proportions.sum()
-    target_cols = proportions * num_terrain_types
-
-    num_cols_per_terrain = np.floor(target_cols).astype(int)
-    remainder = target_cols - num_cols_per_terrain
-    remaining = num_terrain_types - num_cols_per_terrain.sum()
-    if remaining > 0:
-        top_idx = np.argsort(-remainder)[:remaining]
-        num_cols_per_terrain[top_idx] += 1
+    cumsum_props = np.cumsum(proportions)
 
     terrain_type_to_name: list[str] = []
-    for name, n in zip(sub_terrain_names, num_cols_per_terrain):
-        terrain_type_to_name.extend([name] * int(n))
-
-    while len(terrain_type_to_name) < num_terrain_types:
-        terrain_type_to_name.append(sub_terrain_names[-1])
+    for col_idx in range(num_terrain_types):
+        sub_idx = int(np.min(np.where(col_idx / num_terrain_types + 0.001 < cumsum_props)[0]))
+        terrain_type_to_name.append(sub_terrain_names[sub_idx])
 
     return sub_terrain_names, terrain_type_to_name
 
-
-def get_terrain_name(env: ManagerBasedRLEnv, command_term, t_idx: int) -> str:
-    """获取指定列索引对应的地形名称"""
-    _, terrain_type_to_name = get_terrain_mapping(env)
-    if 0 <= t_idx < len(terrain_type_to_name):
-        return terrain_type_to_name[t_idx]
-    return f"Terrain_{t_idx:02d}"
 
 def lin_vel_cmd_levels(
     env: ManagerBasedRLEnv,
@@ -62,7 +45,6 @@ def lin_vel_cmd_levels(
     command_term = env.command_manager.get_term("base_velocity")
     reward_term = env.reward_manager.get_term_cfg(reward_term_name)
 
-    # 如果环境没有包含地形模块，直接返回配置里的基础上限
     if getattr(command_term, "has_terrain", False) is False:
         return torch.tensor(command_term.cfg.ranges.lin_vel_x[1], device=env.device, dtype=torch.float32)
 
@@ -71,149 +53,91 @@ def lin_vel_cmd_levels(
     else:
         env_ids_tensor = env_ids.to(device=env.device, dtype=torch.long)
 
-    if len(env_ids_tensor) == 0:
-        # 如果当前步没有环境 reset，Fallback 返回所有环境的平均最大速度上限
-        all_terrain_types = env.scene.terrain.terrain_types.long()
-        return command_term.terrain_vel_current[all_terrain_types, 1].mean()
-    
-    reset_terrain_types = env.scene.terrain.terrain_types[env_ids_tensor].long()
-    unique_terrains = torch.unique(reset_terrain_types)
-    if env.common_step_counter % env.max_episode_length == 0:
+    # 1. 在每次有环境 Reset 时，记录这些环境本回合的真实单位时间追踪奖励
+    if len(env_ids_tensor) > 0 and hasattr(command_term, "episode_track_rew_ema"):
+        ep_Sums = env.reward_manager._episode_sums[reward_term_name][env_ids_tensor]
+        # 若环境因走出地形边界或正常超时重置，按实际步数时长归一化；若因摔倒提前终止，按整局时长归一化以维持惩罚
+        is_timeout = env.termination_manager.time_outs[env_ids_tensor]
+        actual_time_s = (env.episode_length_buf[env_ids_tensor].float() * env.step_dt).clamp(min=2.0)
+        denom_time_s = torch.where(
+            is_timeout, actual_time_s, torch.full_like(actual_time_s, float(env.max_episode_length_s))
+        )
+        ep_rew_rate = ep_Sums / denom_time_s
+
+        # 过滤掉训练刚开始第 0 步的初始化 Reset
+        valid_ep = env.episode_length_buf[env_ids_tensor] > 10
+        if valid_ep.any():
+            v_ids = env_ids_tensor[valid_ep]
+            v_rates = ep_rew_rate[valid_ep]
+            first_time = ~command_term.episode_completed_mask[v_ids]
+            command_term.episode_track_rew_ema[v_ids] = torch.where(
+                first_time,
+                v_rates,
+                0.7 * command_term.episode_track_rew_ema[v_ids] + 0.3 * v_rates,
+            )
+            command_term.episode_completed_mask[v_ids] = True
+
+    # 2. 每隔 max_episode_length 步，汇总全场景各子地形的 EMA 追踪奖励表现进行课程升级
+    if env.common_step_counter > 0 and env.common_step_counter % env.max_episode_length == 0:
         sub_terrain_names, terrain_type_to_name = get_terrain_mapping(env)
-        
-        category_to_envs = {}
-        category_to_cols = {}
+        all_terrain_types = env.scene.terrain.terrain_types.long()
 
-        for t_type in unique_terrains:
-            t_type_int = int(t_type.item())
-
-            if terrain_type_to_name and 0 <= t_type_int < len(terrain_type_to_name):
-                t_name = terrain_type_to_name[t_type_int]
-                cols = [i for i, name in enumerate(terrain_type_to_name) if name == t_name]
-            else:
-                t_name = f"Terrain_{t_type_int:02d}"
-                cols = [t_type_int]
-
-            if t_name not in category_to_envs:
-                category_to_envs[t_name] = []
-                category_to_cols[t_name] = cols
-            
-            t_mask = (reset_terrain_types == t_type_int)
-            category_to_envs[t_name].append(env_ids_tensor[t_mask])
-
-        for t_name, env_list in category_to_envs.items():
-            t_env_ids = torch.cat(env_list)
-
+        for t_name in sub_terrain_names:
+            cols = [i for i, name in enumerate(terrain_type_to_name) if name == t_name]
+            if not cols:
+                continue
+            cols_tensor = torch.tensor(cols, device=env.device, dtype=torch.long)
+            in_terrain = torch.isin(all_terrain_types, cols_tensor) & command_term.episode_completed_mask
+            t_env_ids = in_terrain.nonzero(as_tuple=False).view(-1)
             if len(t_env_ids) == 0:
                 continue
 
             t_high_vel_mask = command_term.is_high_vel_env[t_env_ids]
-            t_low_vel_mask = ~t_high_vel_mask
-
-            t_low_vel_ids = t_env_ids[t_low_vel_mask.nonzero(as_tuple=True)[0]]
-            t_high_vel_ids = t_env_ids[t_high_vel_mask.nonzero(as_tuple=True)[0]]
+            t_low_vel_ids = t_env_ids[~t_high_vel_mask]
+            t_high_vel_ids = t_env_ids[t_high_vel_mask]
 
             reward_low = (
-                torch.mean(env.reward_manager._episode_sums[reward_term_name][t_low_vel_ids])
-                / env.max_episode_length_s
+                torch.mean(command_term.episode_track_rew_ema[t_low_vel_ids]).item()
                 if len(t_low_vel_ids) > 0
                 else 0.0
             )
             reward_high = (
-                torch.mean(env.reward_manager._episode_sums[reward_term_name][t_high_vel_ids])
-                / env.max_episode_length_s
+                torch.mean(command_term.episode_track_rew_ema[t_high_vel_ids]).item()
                 if len(t_high_vel_ids) > 0
                 else 0.0
             )
 
-            threshold = reward_term.weight * 0.8
+            threshold = reward_term.weight * 0.75
 
             should_upgrade = (
-                (
-                    len(t_low_vel_ids) > 0
-                    and len(t_high_vel_ids) > 0
-                    and reward_low > threshold
-                    and reward_high > threshold
-                )
+                (len(t_low_vel_ids) > 0 and len(t_high_vel_ids) > 0 and reward_low > threshold and reward_high > threshold)
                 or (len(t_low_vel_ids) > 0 and len(t_high_vel_ids) == 0 and reward_low > threshold)
                 or (len(t_low_vel_ids) == 0 and len(t_high_vel_ids) > 0 and reward_high > threshold)
             )
 
             if should_upgrade:
                 delta_command = torch.tensor([-0.2, 0.2], device=env.device)
-                cols_to_update = category_to_cols[t_name]
-
-                ref_col = cols_to_update[0]
+                ref_col = cols[0]
                 current_range = command_term.terrain_vel_current[ref_col]
                 limit_range = command_term.terrain_vel_limits[ref_col]
-
                 new_range = torch.clamp(
                     current_range + delta_command,
                     limit_range[0].item(),
                     limit_range[1].item(),
                 )
-
-                for col in cols_to_update:
+                for col in cols:
                     command_term.terrain_vel_current[col] = new_range
+                # 升级后重置该地形的完成标记，确保下一等级重新评估
+                command_term.episode_completed_mask[t_env_ids] = False
 
                 print(
                     f"[Curriculum Terrain: {t_name}] ✅ UPGRADED! "
                     f"R_low: {reward_low:.4f}, R_high: {reward_high:.4f} (Thresh: {threshold:.4f}) "
-                    f"New Range: [{new_range[0].item():.2f}, {new_range[1].item():.2f}] (Limit: [{limit_range[0].item():.2f}, {limit_range[1].item():.2f}])"
+                    f"New Range: [{new_range[0].item():.2f}, {new_range[1].item():.2f}] "
+                    f"(Limit: [{limit_range[0].item():.2f}, {limit_range[1].item():.2f}])"
                 )
 
-    # ==================== 2. 按 sub_terrain 类型不重复地汇总打印当前速度范围 ====================
-    steps_per_iter = getattr(env, "num_steps_per_env", 24) * 100
-    current_step = env.common_step_counter
-
-    # 初始化静态变量，记录上一次打印的 iteration 编号
-    if not hasattr(lin_vel_cmd_levels, "_last_printed_iter"):
-        lin_vel_cmd_levels._last_printed_iter = -1
-
-    current_iter = current_step // steps_per_iter
-
-    # 在满足打印步数且当前步未打印过时，按照 sub_terrain_names 打印汇总
-    if current_iter != lin_vel_cmd_levels._last_printed_iter and current_step > 0:
-        lin_vel_cmd_levels._last_printed_iter = current_iter
-
-        if getattr(command_term, "has_terrain", False) and hasattr(command_term, "terrain_vel_current"):
-            sub_terrain_names, terrain_type_to_name = get_terrain_mapping(env)
-
-            print(
-                f"\n================ [Iteration {current_iter:04d} | Step {current_step}] 重置环境对应地形速度指令范围汇总 ================"
-            )
-
-            if sub_terrain_names and terrain_type_to_name:
-                # 遍历 sub_terrain_names，保证每种地形类型仅打印一次
-                for t_name in sub_terrain_names:
-                    # 获取映射到该 sub_terrain 的所有列索引 (cols)
-                    cols = [i for i, name in enumerate(terrain_type_to_name) if name == t_name]
-                    if not cols:
-                        continue
-
-                    v_min = command_term.terrain_vel_current[cols, 0].mean().item()
-                    v_max = command_term.terrain_vel_current[cols, 1].mean().item()
-                    v_limit_min = command_term.terrain_vel_limits[cols, 0].mean().item()
-                    v_limit_max = command_term.terrain_vel_limits[cols, 1].mean().item()
-
-                    print(
-                        f"  [{t_name:<20s}] | 当前 range: [{v_min:+.2f}, {v_max:+.2f}] m/s "
-                        f"| 极限 limit: [{v_limit_min:+.2f}, {v_limit_max:+.2f}] m/s"
-                    )
-            else:
-                num_terrains = command_term.terrain_vel_current.shape[0]
-                for t_idx in range(num_terrains):
-                    v_min = command_term.terrain_vel_current[t_idx, 0].item()
-                    v_max = command_term.terrain_vel_current[t_idx, 1].item()
-                    v_limit_min = command_term.terrain_vel_limits[t_idx, 0].item()
-                    v_limit_max = command_term.terrain_vel_limits[t_idx, 1].item()
-                    print(
-                        f"  [Terrain_{t_idx:02d:<15s}] | 当前 range: [{v_min:+.2f}, {v_max:+.2f}] m/s "
-                        f"| 极限 limit: [{v_limit_min:+.2f}, {v_limit_max:+.2f}] m/s"
-                    )
-            print("=" * 95 + "\n")
-    max_vel_limits = command_term.terrain_vel_current[:, 1]
-    return max_vel_limits.mean()
+    return command_term.terrain_vel_current[:, 1].mean()
 # def lin_vel_cmd_levels( env: ManagerBasedRLEnv, env_ids: Sequence[int], reward_term_name: str = "track_lin_vel_xy",) -> torch.Tensor:
 #     command_term = env.command_manager.get_term("base_velocity") # 获取速度命令项
 #     ranges = command_term.cfg.ranges # 获取速度命令项的范围配置
@@ -347,3 +271,242 @@ def terrain_levels_vel(
             extras[terrain_name] = torch.mean(levels[mask]) if mask.any() else levels.new_zeros(())
 
     return extras
+
+# def friction_levels_by_min_terrain(
+#     env: ManagerBasedRLEnv,
+#     env_ids: Sequence[int],
+#     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+#     init_mu_min: float = 0.60,
+#     final_mu_min: float = 0.30,
+#     mu_max: float = 1.25,
+#     start_terrain_level: float = 3.0,
+#     full_terrain_level: float = 7.5,
+#     max_step_drop: float = 0.02,
+#     cooldown_steps: int = 2000,
+# ) -> dict[str, torch.Tensor] | torch.Tensor:
+#     """
+#     零 PxMaterial 创建的防震荡单向棘轮摩擦课程：
+#     - 绝不在运行时调用 root_physx_view.set_material_properties()，彻底杜绝 PhysX 64K 材质上限报错；
+#     - 利用地面 friction_combine_mode="multiply" 特性，通过 UsdPhysics.MaterialAPI 原地修改地面唯一材质的缩放倍率。
+#     """
+#     del env_ids
+#     terrain = getattr(env.scene, "terrain", None)
+#     if terrain is None or not hasattr(terrain, "terrain_levels"):
+#         return torch.tensor(init_mu_min, device=env.device)
+
+#     asset: Articulation = env.scene[asset_cfg.name]
+#     terrain_cfg = terrain.cfg.terrain_generator
+#     levels = terrain.terrain_levels.float()
+
+#     # 1. 第 0 步初始化：只读获取一次启动时分配给各环境的脚底基础摩擦系数（不创建任何新材质）
+#     if not hasattr(env, "_base_foot_friction"):
+#         # get_material_properties() 为纯只读操作，不会触发 PxPhysics::createMaterial
+#         mat_props = asset.root_physx_view.get_material_properties()  # [num_envs, num_shapes, 3]
+#         env._base_foot_friction = mat_props[:, 0, 0].clone().to(env.device)
+#         env._curriculum_mu_min = float(init_mu_min)
+#         env._terrain_level_watermark = float(start_terrain_level)
+#         env._last_mu_update_step = -cooldown_steps
+#         env._ground_mat_apis = None
+
+#         # 查找 /World/ground 下的唯一 USD PhysicsMaterial Prim
+#         try:
+#             from pxr import Usd, UsdPhysics
+#             stage = env.sim.stage
+#             ground_prim = stage.GetPrimAtPath(terrain.cfg.prim_path)
+#             if ground_prim.IsValid():
+#                 apis = []
+#                 for prim in Usd.PrimRange(ground_prim):
+#                     if prim.HasAPI(UsdPhysics.MaterialAPI):
+#                         apis.append(UsdPhysics.MaterialAPI(prim))
+#                 env._ground_mat_apis = apis
+#         except Exception as e:
+#             print(f"[Friction Curriculum] Warning: Failed to locate ground UsdPhysics.MaterialAPI: {e}")
+
+#         # 初始地面摩擦放大倍率 = init_mu_min / final_mu_min (例如 0.60 / 0.30 = 2.0)
+#         init_scale = float(init_mu_min) / max(float(final_mu_min), 1e-3)
+#         if env._ground_mat_apis:
+#             for api in env._ground_mat_apis:
+#                 api.GetStaticFrictionAttr().Set(init_scale)
+#                 api.GetDynamicFrictionAttr().Set(init_scale * 0.95)
+#         env.env_friction_coeffs = env._base_foot_friction * init_scale
+
+#     # 2. 计算所有非平地子地形的平均等级最小值 min_terrain_level
+#     sub_levels = []
+#     if terrain_cfg is not None and terrain_cfg.sub_terrains is not None:
+#         for terrain_name, sub_cfg in terrain_cfg.sub_terrains.items():
+#             if getattr(sub_cfg, "proportion", 0.0) <= 0.0:
+#                 continue
+#             if terrain_name == "flat" and len(terrain_cfg.sub_terrains) > 1:
+#                 continue
+#             mask = is_robot_on_terrain(env, terrain_name)
+#             if mask.any():
+#                 sub_levels.append(torch.mean(levels[mask]))
+
+#     min_terrain_level = torch.amin(torch.stack(sub_levels)) if len(sub_levels) > 0 else torch.mean(levels)
+#     cur_min_lvl = float(min_terrain_level.item())
+
+#     # 3. 水位线单向棘轮更新：仅当短板地形等级创新高且满冷却步数时，原地降低地面唯一材质的摩擦倍率
+#     if (
+#         cur_min_lvl > env._terrain_level_watermark + 0.05
+#         and (env.common_step_counter - env._last_mu_update_step) >= cooldown_steps
+#     ):
+#         env._terrain_level_watermark = cur_min_lvl
+#         env._last_mu_update_step = int(env.common_step_counter)
+
+#         progress = np.clip(
+#             (env._terrain_level_watermark - start_terrain_level) / max(full_terrain_level - start_terrain_level, 1e-3),
+#             0.0,
+#             1.0,
+#         )
+#         ideal_mu_min = init_mu_min - progress * (init_mu_min - final_mu_min)
+#         env._curriculum_mu_min = max(float(ideal_mu_min), env._curriculum_mu_min - max_step_drop, final_mu_min)
+
+#         # 计算地面材质缩放倍率 (从 init_mu_min/final_mu_min 平滑降至 1.0)
+#         ground_mu_scale = env._curriculum_mu_min / max(float(final_mu_min), 1e-3)
+#         if env._ground_mat_apis:
+#             for api in env._ground_mat_apis:
+#                 api.GetStaticFrictionAttr().Set(float(ground_mu_scale))
+#                 api.GetDynamicFrictionAttr().Set(float(ground_mu_scale * 0.95))
+
+#         # 更新各环境当前的实际有效摩擦系数 (由于地面材质为 multiply 模式，有效摩擦 = 脚底摩擦 * 地面摩擦)
+#         env.env_friction_coeffs = env._base_foot_friction * ground_mu_scale
+
+#         print(
+#             f"[Friction Curriculum] 📉 Terrain Watermark {env._terrain_level_watermark:.2f} -> "
+#             f"Effective mu_min lowered to {env._curriculum_mu_min:.3f} (ground scale: {ground_mu_scale:.2f}x)"
+#         )
+
+#     return {
+#         "min_terrain_level": min_terrain_level,
+#         "terrain_watermark": torch.tensor(env._terrain_level_watermark, device=env.device),
+#         "friction_lower_bound": torch.tensor(env._curriculum_mu_min, device=env.device),
+#     }
+
+def friction_levels_by_min_terrain(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    init_mu_min: float = 0.60,
+    final_mu_min: float = 0.30,
+    mu_max: float = 1.25,
+    start_terrain_level: float = 3.0,
+    min_hold_level: float = 2.0,
+    max_step_drop: float = 0.02,
+    cooldown_steps: int = 2000,
+) -> dict[str, torch.Tensor] | torch.Tensor:
+    """
+    基于【动态 EMA 止跌企稳判据 + 物理自适应底线】的零材质泄漏摩擦课程：
+    1. 彻底移除死板的全局最高水位线 (terrain_watermark)，避免降摩擦后因稳态等级下降而卡死；
+    2. 止跌企稳触发机制：
+       - 每次降低摩擦后，若地形等级正在下滑 (cur_lvl < level_ema - 0.03)，暂停降摩擦等待策略适应；
+       - 一旦地形等级在新摩擦下止跌企稳或回升 (cur_lvl >= level_ema - 0.03)，且高于当前摩擦对应的能力底线，
+         即便绝对等级低于高摩擦时期的峰值，在满 cooldown_steps 后仍继续稳步下调摩擦系数；
+    3. 仅原地修改地面唯一 USD 材质缩放倍率，零 PxMaterial 创建，彻底规避 PhysX 64K 材质上限报错。
+    """
+    del env_ids
+    terrain = getattr(env.scene, "terrain", None)
+    if terrain is None or not hasattr(terrain, "terrain_levels"):
+        return torch.tensor(init_mu_min, device=env.device)
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    terrain_cfg = terrain.cfg.terrain_generator
+    levels = terrain.terrain_levels.float()
+
+    # 1. 计算所有非平地子地形的平均等级最小值 min_terrain_level
+    sub_levels = []
+    if terrain_cfg is not None and terrain_cfg.sub_terrains is not None:
+        for terrain_name, sub_cfg in terrain_cfg.sub_terrains.items():
+            if getattr(sub_cfg, "proportion", 0.0) <= 0.0:
+                continue
+            if terrain_name == "flat" and len(terrain_cfg.sub_terrains) > 1:
+                continue
+            mask = is_robot_on_terrain(env, terrain_name)
+            if mask.any():
+                sub_levels.append(torch.mean(levels[mask]))
+
+    min_terrain_level = torch.amin(torch.stack(sub_levels)) if len(sub_levels) > 0 else torch.mean(levels)
+    cur_min_lvl = float(min_terrain_level.item())
+
+    # 2. 第 0 步初始化：只读记录启动时各环境的脚底基础摩擦系数与地面材质接口
+    if not hasattr(env, "_base_foot_friction"):
+        mat_props = asset.root_physx_view.get_material_properties()
+        env._base_foot_friction = mat_props[:, 0, 0].clone().to(env.device)
+        env._curriculum_mu_min = float(init_mu_min)
+        env._min_lvl_ema = cur_min_lvl
+        env._friction_curriculum_unlocked = False
+        env._last_mu_update_step = 0
+        env._ground_mat_apis = None
+
+        try:
+            from pxr import Usd, UsdPhysics
+            stage = env.sim.stage
+            ground_prim = stage.GetPrimAtPath(terrain.cfg.prim_path)
+            if ground_prim.IsValid():
+                env._ground_mat_apis = [
+                    UsdPhysics.MaterialAPI(p)
+                    for p in Usd.PrimRange(ground_prim)
+                    if p.HasAPI(UsdPhysics.MaterialAPI)
+                ]
+        except Exception as e:
+            print(f"[Friction Curriculum] Warning: Failed to locate ground UsdPhysics.MaterialAPI: {e}")
+
+        init_scale = float(init_mu_min) / max(float(final_mu_min), 1e-3)
+        if env._ground_mat_apis:
+            for api in env._ground_mat_apis:
+                api.GetStaticFrictionAttr().Set(init_scale)
+                api.GetDynamicFrictionAttr().Set(init_scale * 0.95)
+        env.env_friction_coeffs = env._base_foot_friction * init_scale
+
+    # 3. 更新短板地形等级的滑动均值 level_ema（时间常数约 500 步，用于判断当前是“正在掉级”还是“已企稳”）
+    env._min_lvl_ema = 0.998 * env._min_lvl_ema + 0.002 * cur_min_lvl
+
+    # 首次达到 start_terrain_level (3.0) 时解锁摩擦课程
+    if not env._friction_curriculum_unlocked and cur_min_lvl >= start_terrain_level:
+        env._friction_curriculum_unlocked = True
+        env._min_lvl_ema = cur_min_lvl
+
+    # 计算当前摩擦系数对应的物理能力底线：
+    # 当 mu_min = 0.60 时要求 >= 3.0 级；当 mu_min 降至 0.30 时平滑放宽至 min_hold_level (2.0 级)
+    mu_progress = np.clip((init_mu_min - env._curriculum_mu_min) / max(init_mu_min - final_mu_min, 1e-3), 0.0, 1.0)
+    required_floor_level = start_terrain_level - mu_progress * (start_terrain_level - min_hold_level)
+
+    # 4. 止跌企稳判断与摩擦步进下调：
+    # 条件：(a) 课程已解锁 且 摩擦尚未到底；
+    #       (b) 距上次下调已满 cooldown_steps (2000步)；
+    #       (c) 当前短板等级高于能力底线 (cur_min_lvl >= required_floor_level)；
+    #       (d) 地形等级已止跌企稳或正在上升 (cur_min_lvl >= env._min_lvl_ema - 0.03)
+    is_stabilized = cur_min_lvl >= (env._min_lvl_ema - 0.03)
+    is_competent = cur_min_lvl >= required_floor_level
+    cooldown_ready = (env.common_step_counter - env._last_mu_update_step) >= cooldown_steps
+
+    if (
+        env._friction_curriculum_unlocked
+        and env._curriculum_mu_min > final_mu_min + 1e-4
+        and cooldown_ready
+        and is_competent
+        and is_stabilized
+    ):
+        env._curriculum_mu_min = max(final_mu_min, env._curriculum_mu_min - max_step_drop)
+        env._last_mu_update_step = int(env.common_step_counter)
+        # 重置滑动均值基准为当前等级，下一轮只需在新摩擦的平衡点处企稳即可继续推进
+        env._min_lvl_ema = cur_min_lvl
+
+        ground_mu_scale = env._curriculum_mu_min / max(float(final_mu_min), 1e-3)
+        if env._ground_mat_apis:
+            for api in env._ground_mat_apis:
+                api.GetStaticFrictionAttr().Set(float(ground_mu_scale))
+                api.GetDynamicFrictionAttr().Set(float(ground_mu_scale * 0.95))
+
+        env.env_friction_coeffs = env._base_foot_friction * ground_mu_scale
+
+        print(
+            f"[Friction Curriculum] ✅ Stabilized at level {cur_min_lvl:.2f} (floor: {required_floor_level:.2f}) -> "
+            f"mu_min stepped down to {env._curriculum_mu_min:.3f} (ground scale: {ground_mu_scale:.2f}x)"
+        )
+
+    return {
+        "min_terrain_level": min_terrain_level,
+        "level_ema": torch.tensor(env._min_lvl_ema, device=env.device),
+        "required_floor": torch.tensor(required_floor_level, device=env.device),
+        "friction_lower_bound": torch.tensor(env._curriculum_mu_min, device=env.device),
+    }

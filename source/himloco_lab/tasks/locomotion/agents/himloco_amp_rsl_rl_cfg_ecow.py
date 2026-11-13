@@ -45,7 +45,7 @@ class AMPPPORunnerCfg(AMPOnPolicyRunnerCfg):
         amp_replay_buffer_size=1000000,
     )
     amp_motion_files = _AMP_MOTION_FILES
-    amp_reward_coef = 0.05 #0.06 #0.03 # #0.3 #0.5 * 0.02 #0.3
+    amp_reward_coef = 0.002 #0.002 #0.06 #0.03 # #0.3 #0.5 * 0.02 #0.3
     """Coefficient for AMP style reward."""
     amp_task_reward_lerp = 0.7 #0.5 #0.3 #0.7
     """Ratio to lerp between task reward and style reward."""
@@ -53,7 +53,7 @@ class AMPPPORunnerCfg(AMPOnPolicyRunnerCfg):
 
     # ==================== 训练模式切换开关 ====================
     # 可选: "bptt" (SuperMimic 世界模型 + BPTT 想象训练) | "ppo" (传统无模型 AMP-PPO)
-    train_mode: str = "bptt"
+    train_mode: str = "ppo"
 
     # ==================== SuperMimic 世界模型与 BPTT 超参数 ====================
     wm_window_len: int = 8               # k = 8 步自回归世界模型拟合窗口

@@ -32,8 +32,10 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Normal
-from ..modules.him_estimator import HIMEstimator
+from .him_estimator import HIMEstimator
+
 
 class RunningMeanStd:
     # Dynamically calculate mean and std

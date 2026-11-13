@@ -1,3 +1,4 @@
+# 完整替换 source/himloco_lab/rsl_rl/runners/amp_on_policy_runner.py
 # Copyright (c) 2025, HimLoco Lab Project Developers.
 # All rights reserved.
 #
@@ -47,11 +48,11 @@ class AMPOnPolicyRunner:
         self.writer: SummaryWriter | None = None
 
         # 解析训练模式: 优先读取 train_mode ("ppo" / "bptt")，其次兼容 use_bptt 布尔值
-        raw_mode = self.alg_cfg.get("train_mode", self.cfg.get("train_mode", None))
+        raw_mode = self._get_cfg("train_mode", None)
         if raw_mode is not None:
             self.train_mode = str(raw_mode).strip().lower()
         else:
-            use_bptt = bool(self.alg_cfg.get("use_bptt", self.cfg.get("use_bptt", False)))
+            use_bptt = bool(self._get_cfg("use_bptt", False))
             self.train_mode = "bptt" if use_bptt else "ppo"
 
         if self.train_mode not in ("ppo", "bptt"):
@@ -99,7 +100,7 @@ class AMPOnPolicyRunner:
         else:
             min_std = torch.tensor(min_normalized_std, device=self.device, dtype=torch.float32)
 
-        # 实例化算法类 (自动过滤签名，兼容不同版本的 AMPPPO.__init__)
+        # 实例化算法类
         alg_class_name = self.alg_cfg.pop("class_name", "AMPPPO")
         alg_class = eval(alg_class_name)
         alg_sig = inspect.signature(alg_class.__init__)
@@ -133,7 +134,7 @@ class AMPOnPolicyRunner:
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
 
-        # 初始化 PPO Rollout Storage (自动适配 5 参数或 6 参数签名)
+        # 初始化 PPO Rollout Storage
         storage_params = list(inspect.signature(self.alg.init_storage).parameters.values())
         required_pos_args = [
             p
@@ -167,6 +168,15 @@ class AMPOnPolicyRunner:
         self.tot_time = 0.0
         self.current_learning_iteration = 0
 
+    def _get_cfg(self, key: str, default, *aliases: str):
+        """优先从 alg_cfg 读取，其次从顶层 cfg 读取，并支持字段别名兼容"""
+        for k in (key, *aliases):
+            if hasattr(self, "alg_cfg") and k in self.alg_cfg and self.alg_cfg[k] is not None:
+                return self.alg_cfg[k]
+            if hasattr(self, "cfg") and k in self.cfg and self.cfg[k] is not None:
+                return self.cfg[k]
+        return default
+
     # ==========================================================================
     # 内部辅助方法：初始化 BPTT 组件与环境状态读取
     # ==========================================================================
@@ -176,13 +186,13 @@ class AMPOnPolicyRunner:
         default_q = robot.data.default_joint_pos[0].clone().to(self.device)
         joint_limits = robot.data.soft_joint_pos_limits[0].clone().to(self.device)
         nominal_height = float(
-            self.alg_cfg.get(
+            self._get_cfg(
                 "nominal_height",
                 getattr(unwrapped, "nominal_base_height", robot.data.default_root_state[0, 2].item()),
             )
         )
-        min_height = float(self.alg_cfg.get("min_height", max(0.25, nominal_height * 0.45)))
-        max_tilt_deg = float(self.alg_cfg.get("max_tilt_deg", 65.0))
+        min_height = float(self._get_cfg("min_height", max(0.25, nominal_height * 0.45)))
+        max_tilt_deg = float(self._get_cfg("max_tilt_deg", 65.0))
         num_one_step_obs = getattr(self.env, "num_one_step_obs", 45)
 
         init_sig = inspect.signature(self.alg.init_supermimic_bptt)
@@ -192,12 +202,12 @@ class AMPOnPolicyRunner:
             num_one_step_obs=num_one_step_obs,
             default_joint_pos=default_q,
             joint_limits=joint_limits,
-            wm_width=int(self.alg_cfg.get("wm_width", 2048)),
-            wm_lr=float(self.alg_cfg.get("wm_lr", 2e-4)),
-            actor_lr=float(self.alg_cfg.get("actor_lr", self.alg_cfg.get("learning_rate", 2e-4))),
-            critic_lr=float(self.alg_cfg.get("critic_lr", 2e-4)),
-            horizon=int(self.alg_cfg.get("bptt_horizon", 32)),
-            wm_buffer_steps=int(self.alg_cfg.get("wm_buffer_steps", 256)),
+            wm_width=int(self._get_cfg("wm_width", 2048)),
+            wm_lr=float(self._get_cfg("wm_lr", 2e-4)),
+            actor_lr=float(self._get_cfg("actor_lr", 2e-4)),
+            critic_lr=float(self._get_cfg("critic_lr", 2e-4)),
+            horizon=int(self._get_cfg("bptt_horizon", 32, "horizon")),
+            wm_buffer_steps=int(self._get_cfg("wm_buffer_steps", 256, "wm_buffer_capacity")),
         )
         if "nominal_height" in init_sig.parameters:
             init_kwargs["nominal_height"] = nominal_height
@@ -267,23 +277,54 @@ class AMPOnPolicyRunner:
         return torch.zeros((self.env.num_envs, 4), device=self.device, dtype=torch.float32)
 
     def _unpack_env_step(self, step_out: tuple):
-        """Robustly unpacks environment step outputs of any length (4, 5, 7, 8, etc.)."""
+        """准确解包 HimlocoVecEnvWrapper.step 返回的 8 元组:
+        (obs, privileged_obs, rewards, dones, infos, termination_ids, termination_privileged_obs, terminal_amp_states)
+        """
         if not isinstance(step_out, (tuple, list)):
-            return step_out, None, None, None, {}, torch.tensor([], dtype=torch.long, device=self.device), None
+            return (
+                step_out,
+                None,
+                None,
+                None,
+                {},
+                torch.tensor([], dtype=torch.long, device=self.device),
+                None,
+                None,
+            )
 
         length = len(step_out)
         if length == 8:
-            obs, privileged_obs, rewards, dones, infos, _, reset_env_ids, terminal_amp_states = step_out
+            (
+                obs,
+                privileged_obs,
+                rewards,
+                dones,
+                infos,
+                reset_env_ids,
+                termination_privileged_obs,
+                terminal_amp_states,
+            ) = step_out
         elif length == 7:
             obs, privileged_obs, rewards, dones, infos, reset_env_ids, terminal_amp_states = step_out
+            termination_privileged_obs = None
         elif length == 5:
             obs, privileged_obs, rewards, dones, infos = step_out
-            reset_env_ids = dones.nonzero(as_tuple=False).flatten() if isinstance(dones, torch.Tensor) else torch.tensor([], dtype=torch.long, device=self.device)
+            reset_env_ids = (
+                dones.nonzero(as_tuple=False).view(-1)
+                if isinstance(dones, torch.Tensor)
+                else torch.tensor([], dtype=torch.long, device=self.device)
+            )
+            termination_privileged_obs = None
             terminal_amp_states = None
         elif length == 4:
             obs, rewards, dones, infos = step_out
             privileged_obs = infos.get("observations", {}).get("critic", None) if isinstance(infos, dict) else None
-            reset_env_ids = dones.nonzero(as_tuple=False).flatten() if isinstance(dones, torch.Tensor) else torch.tensor([], dtype=torch.long, device=self.device)
+            reset_env_ids = (
+                dones.nonzero(as_tuple=False).view(-1)
+                if isinstance(dones, torch.Tensor)
+                else torch.tensor([], dtype=torch.long, device=self.device)
+            )
+            termination_privileged_obs = None
             terminal_amp_states = None
         else:
             obs = step_out[0]
@@ -291,17 +332,43 @@ class AMPOnPolicyRunner:
             rewards = step_out[2] if length > 2 else None
             dones = step_out[3] if length > 3 else None
             infos = step_out[4] if length > 4 else {}
-            reset_env_ids = dones.nonzero(as_tuple=False).flatten() if isinstance(dones, torch.Tensor) else torch.tensor([], dtype=torch.long, device=self.device)
+            reset_env_ids = (
+                step_out[5]
+                if length > 5
+                else (
+                    dones.nonzero(as_tuple=False).view(-1)
+                    if isinstance(dones, torch.Tensor)
+                    else torch.tensor([], dtype=torch.long, device=self.device)
+                )
+            )
+            termination_privileged_obs = step_out[6] if length > 7 else None
             terminal_amp_states = step_out[7] if length > 7 else (step_out[6] if length > 6 else None)
 
-        # 强制将 reset_env_ids 转换为标准 PyTorch LongTensor，防止 Tensor 索引报错
-        if reset_env_ids is not None:
+        # 强制保证 reset_env_ids 是 1D LongTensor（若维度异常则直接从 dones 重新计算）
+        if reset_env_ids is None:
+            reset_env_ids = torch.tensor([], dtype=torch.long, device=self.device)
+        else:
             if not isinstance(reset_env_ids, torch.Tensor):
                 reset_env_ids = torch.tensor(reset_env_ids, dtype=torch.long, device=self.device)
+            if reset_env_ids.ndim > 1 or reset_env_ids.dtype.is_floating_point:
+                reset_env_ids = (
+                    dones.nonzero(as_tuple=False).view(-1).to(device=self.device, dtype=torch.long)
+                    if isinstance(dones, torch.Tensor)
+                    else torch.tensor([], dtype=torch.long, device=self.device)
+                )
             else:
-                reset_env_ids = reset_env_ids.to(device=self.device, dtype=torch.long)
+                reset_env_ids = reset_env_ids.view(-1).to(device=self.device, dtype=torch.long)
 
-        return obs, privileged_obs, rewards, dones, infos, reset_env_ids, terminal_amp_states
+        return (
+            obs,
+            privileged_obs,
+            rewards,
+            dones,
+            infos,
+            reset_env_ids,
+            termination_privileged_obs,
+            terminal_amp_states,
+        )
 
     # ==========================================================================
     # 训练统一入口 (通过 train_mode 分发至 learn_ppo 或 learn_bptt)
@@ -350,9 +417,17 @@ class AMPOnPolicyRunner:
                 for _ in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs, amp_obs)
                     step_out = self.env.step(actions)
-                    obs, privileged_obs, rewards, dones, infos, reset_env_ids, terminal_amp_states = (
-                        self._unpack_env_step(step_out)
-                    )
+                    (
+                        obs,
+                        privileged_obs,
+                        rewards,
+                        dones,
+                        infos,
+                        reset_env_ids,
+                        termination_privileged_obs,
+                        terminal_amp_states,
+                    ) = self._unpack_env_step(step_out)
+
                     critic_obs = privileged_obs if privileged_obs is not None else obs
                     obs, critic_obs, rewards, dones = (
                         obs.to(self.device),
@@ -362,9 +437,13 @@ class AMPOnPolicyRunner:
                     )
                     next_amp_obs = self.env.get_amp_observations().to(self.device)
 
-                    # 还原终止环境的 AMP 观测
+                    # 还原终止环境的 Critic 特权观测与 AMP 观测
+                    next_critic_obs = critic_obs.clone().detach()
+                    if termination_privileged_obs is not None and reset_env_ids.numel() > 0:
+                        next_critic_obs[reset_env_ids] = termination_privileged_obs.to(self.device).clone().detach()
+
                     next_amp_obs_with_term = torch.clone(next_amp_obs)
-                    if terminal_amp_states is not None and len(reset_env_ids) > 0:
+                    if terminal_amp_states is not None and reset_env_ids.numel() > 0:
                         next_amp_obs_with_term[reset_env_ids] = terminal_amp_states.to(self.device)
 
                     # 融合任务奖励与 AMP 判别器风格奖励
@@ -375,9 +454,9 @@ class AMPOnPolicyRunner:
 
                     if "next_critic_obs" in proc_params and len(proc_params) >= 5:
                         if proc_params.index("next_critic_obs") == 3:
-                            self.alg.process_env_step(rewards, dones, infos, critic_obs, next_amp_obs_with_term)
+                            self.alg.process_env_step(rewards, dones, infos, next_critic_obs, next_amp_obs_with_term)
                         else:
-                            self.alg.process_env_step(rewards, dones, infos, next_amp_obs_with_term, critic_obs)
+                            self.alg.process_env_step(rewards, dones, infos, next_amp_obs_with_term, next_critic_obs)
                     else:
                         self.alg.process_env_step(rewards, dones, infos, next_amp_obs_with_term)
 
@@ -452,22 +531,24 @@ class AMPOnPolicyRunner:
         if not hasattr(self.alg, "world_model") or self.alg.world_model is None:
             self._init_bptt_components()
 
-        # 读取 SuperMimic BPTT 超参数
-        warmup_steps = int(self.alg_cfg.get("wm_warmup_steps", 64))
-        pretrain_updates = int(self.alg_cfg.get("wm_pretrain_updates", 500))
-        collect_steps = int(self.alg_cfg.get("bptt_collect_steps", 3))
-        bptt_batch_size = int(self.alg_cfg.get("bptt_batch_size", 1024))
-        wm_batch_size = int(self.alg_cfg.get("wm_batch_size", 2048))
-        wm_batches = int(self.alg_cfg.get("wm_batches", 10))
-        critic_epochs = int(self.alg_cfg.get("num_learning_epochs", 5))
-        critic_minibatches = int(self.alg_cfg.get("num_mini_batches", 4))
-        exp_initial = float(self.alg_cfg.get("exploration_initial", self.alg_cfg.get("exploration_std", 0.1)))
-        exp_final = float(self.alg_cfg.get("exploration_final", exp_initial))
-        exp_decay = int(self.alg_cfg.get("exploration_decay_updates", 10000))
-        lr_decay_updates = int(self.alg_cfg.get("lr_decay_updates", 250000))
-        base_actor_lr = float(self.alg_cfg.get("actor_lr", self.alg_cfg.get("learning_rate", 2e-4)))
-        base_wm_lr = float(self.alg_cfg.get("wm_lr", 2e-4))
-        base_critic_lr = float(self.alg_cfg.get("critic_lr", 2e-4))
+        # 读取 SuperMimic BPTT 超参数（兼容顶层 cfg 与 algorithm 子字典及别名）
+        warmup_steps = int(self._get_cfg("wm_warmup_steps", 64))
+        pretrain_updates = int(self._get_cfg("wm_pretrain_updates", 500))
+        collect_steps = int(self._get_cfg("bptt_collect_steps", 3, "bptt_sim_steps_per_update"))
+        bptt_batch_size = int(self._get_cfg("bptt_batch_size", 1024))
+        wm_batch_size = int(self._get_cfg("wm_batch_size", 2048))
+        wm_batches = int(self._get_cfg("wm_batches", 10, "wm_batches_per_update"))
+        critic_epochs = int(self._get_cfg("num_learning_epochs", 5))
+        critic_minibatches = int(self._get_cfg("num_mini_batches", 4))
+        exp_initial = float(
+            self._get_cfg("exploration_initial", 0.1, "bptt_action_noise_std", "exploration_std")
+        )
+        exp_final = float(self._get_cfg("exploration_final", exp_initial))
+        exp_decay = int(self._get_cfg("exploration_decay_updates", 10000))
+        lr_decay_updates = int(self._get_cfg("lr_decay_updates", 250000))
+        base_actor_lr = float(self._get_cfg("actor_lr", 2e-4))
+        base_wm_lr = float(self._get_cfg("wm_lr", 2e-4))
+        base_critic_lr = float(self._get_cfg("critic_lr", 2e-4))
 
         obs_history = self._get_obs_tensor()
         amp_obs = self.env.get_amp_observations().to(self.device)
@@ -492,9 +573,17 @@ class AMPOnPolicyRunner:
                     action = det_action + noise_std * torch.randn_like(det_action)
 
                     step_out = self.env.step(action)
-                    next_obs, _, task_rewards, dones, infos, reset_env_ids, terminal_amp_states = (
-                        self._unpack_env_step(step_out)
-                    )
+                    (
+                        next_obs,
+                        _,
+                        task_rewards,
+                        dones,
+                        infos,
+                        reset_env_ids,
+                        _,
+                        terminal_amp_states,
+                    ) = self._unpack_env_step(step_out)
+
                     if isinstance(infos, dict) and "observations" in infos and "obs_history" in infos["observations"]:
                         next_obs_history = infos["observations"]["obs_history"].to(self.device)
                     else:
@@ -506,28 +595,13 @@ class AMPOnPolicyRunner:
                     # 还原 Reset 环境的终端 AMP 状态并写入 AMP 经验池
                     next_amp_obs = self.env.get_amp_observations().to(self.device)
                     next_amp_obs_with_term = torch.clone(next_amp_obs)
-                    if terminal_amp_states is not None and len(reset_env_ids) > 0:
-                        # 确保 reset_env_ids 是合法的 torch.LongTensor
-                        if not isinstance(reset_env_ids, torch.Tensor):
-                            reset_env_ids = torch.tensor(reset_env_ids, dtype=torch.long, device=self.device)
-                        else:
-                            reset_env_ids = reset_env_ids.to(device=self.device, dtype=torch.long)
-
+                    if terminal_amp_states is not None and reset_env_ids.numel() > 0:
                         term_states = terminal_amp_states.to(self.device)
-                        # 如果 next_amp_obs_with_term 带有时间/历史维度 [num_envs, history_len, feat_dim]，
-                        # 而 term_states 是单帧 [num_reset_envs, feat_dim]，则将其填入最新帧或整段历史
-                        if next_amp_obs_with_term.ndim == 3 and term_states.ndim == 2:
-                            # 填入最后一帧（最新帧）
-                            next_amp_obs_with_term[reset_env_ids, -1, :] = term_states
-                        elif next_amp_obs_with_term.ndim == 3 and term_states.ndim == 3:
-                            next_amp_obs_with_term[reset_env_ids] = term_states
-                        else:
-                            next_amp_obs_with_term[reset_env_ids] = term_states
-                        # next_amp_obs_with_term[reset_env_ids] = terminal_amp_states.to(self.device)
+                        next_amp_obs_with_term[reset_env_ids] = term_states
 
                     self.alg.amp_storage.insert(amp_obs, next_amp_obs_with_term)
 
-                    # 计算融合了 AMP 风格奖励与环境任务奖励的综合奖励
+                    # 计算融合了 AMP 风格奖励与环境任务奖励的综合奖励（用于 TensorBoard 真实回合奖励统计）
                     combined_rewards = self.alg.discriminator.predict_amp_reward(
                         amp_obs, next_amp_obs_with_term, task_rewards, normalizer=self.alg.amp_normalizer
                     )[0].view(-1)
@@ -544,13 +618,15 @@ class AMPOnPolicyRunner:
                     feet_contact = self._get_feet_contact(infos)
 
                     # 仅使用未发生重置的有效步更新世界模型的 RunningNorm 统计量
+                    # 注意：世界模型 task_head 学习的是纯环境任务奖励 task_rewards，想象阶段再与可微 AMP 风格奖励融合
                     valid_mask = ~(terminated | truncated)
                     self.alg.world_model.update_stats(
                         state,
                         next_state,
                         action,
-                        reward=combined_rewards,
+                        reward=task_rewards,
                         valid_mask=valid_mask,
+                        amp_obs=next_amp_obs_with_term,
                     )
 
                     self.alg.wm_replay.add(
@@ -562,10 +638,11 @@ class AMPOnPolicyRunner:
                         obs_history=obs_history,
                         next_obs_history=next_obs_history,
                         command=cmd,
-                        reward=combined_rewards,
+                        reward=task_rewards,
                         terminated=terminated,
                         truncated=truncated,
                         feet_contact=feet_contact,
+                        next_amp_obs=next_amp_obs_with_term,
                     )
 
                     if self.log_dir is not None:
@@ -576,7 +653,7 @@ class AMPOnPolicyRunner:
                                 ep_infos.append(infos["log"])
                         cur_reward_sum += combined_rewards
                         cur_episode_length += 1
-                        new_ids = (dones > 0).nonzero(as_tuple=False)
+                        new_ids = dones.nonzero(as_tuple=False)
                         if len(new_ids) > 0:
                             rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                             lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
@@ -672,11 +749,11 @@ class AMPOnPolicyRunner:
         if hasattr(self.alg, "update_amp_discriminator"):
             return self.alg.update_amp_discriminator(batch_size=batch_size)
 
-        if self.alg.amp_storage.num_samples < batch_size:
+        if self.alg.amp_storage.num_samples == 0:
             return {"amp_loss": 0.0, "amp_grad_pen": 0.0}
 
         if not hasattr(self, "_bptt_disc_optimizer"):
-            disc_lr = float(self.alg_cfg.get("discriminator_lr", 1e-5))
+            disc_lr = float(self._get_cfg("discriminator_lr", 1e-5))
             self._bptt_disc_optimizer = torch.optim.Adam(
                 [
                     {"params": self.alg.discriminator.trunk.parameters(), "weight_decay": 1e-3},
@@ -730,14 +807,17 @@ class AMPOnPolicyRunner:
             for key in locs["ep_infos"][0]:
                 infotensor = torch.tensor([], device=self.device)
                 for ep_info in locs["ep_infos"]:
+                    if key not in ep_info:
+                        continue
                     if not isinstance(ep_info[key], torch.Tensor):
                         ep_info[key] = torch.Tensor([ep_info[key]])
                     if len(ep_info[key].shape) == 0:
                         ep_info[key] = ep_info[key].unsqueeze(0)
-                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
-                value = torch.mean(infotensor)
-                self.writer.add_scalar("Episode/" + key, value, locs["it"])
-                ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
+                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device).float()))
+                if infotensor.numel() > 0:
+                    value = torch.mean(infotensor)
+                    self.writer.add_scalar("Episode/" + key, value, locs["it"])
+                    ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
 
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / max(locs["collection_time"] + locs["learn_time"], 1e-6))
@@ -808,14 +888,17 @@ class AMPOnPolicyRunner:
             for key in locs["ep_infos"][0]:
                 infotensor = torch.tensor([], device=self.device)
                 for ep_info in locs["ep_infos"]:
+                    if key not in ep_info:
+                        continue
                     if not isinstance(ep_info[key], torch.Tensor):
                         ep_info[key] = torch.Tensor([ep_info[key]])
                     if len(ep_info[key].shape) == 0:
                         ep_info[key] = ep_info[key].unsqueeze(0)
-                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
-                value = torch.mean(infotensor)
-                self.writer.add_scalar("Episode/" + key, value, locs["it"])
-                ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
+                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device).float()))
+                if infotensor.numel() > 0:
+                    value = torch.mean(infotensor)
+                    self.writer.add_scalar("Episode/" + key, value, locs["it"])
+                    ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
 
         fps = int(collect_steps * self.env.num_envs / max(iteration_time, 1e-6))
 
