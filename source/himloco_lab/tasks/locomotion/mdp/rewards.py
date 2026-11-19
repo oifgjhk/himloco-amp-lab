@@ -253,25 +253,17 @@ def joint_position_penalty(
     max_angle_deadzone: float = 0.35,
 ) -> torch.Tensor:
     """
-    支持【站立迈步归位】与【四足地形投影坡度自适应】的关节位置惩罚：
-    - 当收到站立指令 (cmd=0) 但机器人仍在减速或四足尚未归位到髋部下方时，保持行走态权重 (alpha -> 1.0)，
-      允许双腿自由迈出调整步；
-    - 当四足已归位到髋下对称位置且机身停稳后，平滑切入 stand_still_scale 锁定站姿。
+    兼顾【防0速伸腿作弊】、【重载质心微调】与【地形坡度自适应】的关节位置惩罚：
+    1. 仅由速度指令 cmd 与机身实际速度 body_vel 控制动/静过渡系数 alpha，彻底堵死0速伸腿悬空免罚漏洞；
+    2. 对 thigh/calf 俯仰关节在平地开放 0.10 rad 基础死区，允许机器人在偏心重负载下平移重心以均摊四足受力；
+    3. 在斜坡与楼梯上随四足投影坡度自动放宽姿态死区并衰减静止放大倍数。
     """
     asset: Articulation = env.scene[asset_cfg.name]
     cmd = torch.linalg.norm(env.command_manager.get_command("base_velocity")[:, :3], dim=1)
-    body_vel = torch.linalg.norm(asset.data.root_lin_vel_b[:, :2], dim=1) + 0.5 * torch.abs(asset.data.root_ang_vel_b[:, 2])
-
-    # 检测四足是否已归位到 thigh 正下方（未归位时视为仍处于调整运动中）
-    if hasattr(env, "_stand_balance_indices_cache"):
-        thigh_ids, foot_ids, _ = env._stand_balance_indices_cache
-        max_foot_offset = torch.amax(
-            torch.linalg.norm(asset.data.body_pos_w[:, foot_ids, :2] - asset.data.body_pos_w[:, thigh_ids, :2], dim=-1),
-            dim=-1,
-        )
-        adjust_motion = 2.0 * torch.clamp(max_foot_offset - 0.08, min=0.0)
-    else:
-        adjust_motion = torch.zeros_like(cmd)
+    body_vel = (
+        torch.linalg.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+        + 0.5 * torch.abs(asset.data.root_ang_vel_b[:, 2])
+    )
 
     q_curr = asset.data.joint_pos[:, asset_cfg.joint_ids]
     q_def = asset.data.default_joint_pos[:, asset_cfg.joint_ids]
@@ -279,21 +271,25 @@ def joint_position_penalty(
 
     if stand_default_joint_pos is not None:
         stand_target = torch.tensor(stand_default_joint_pos, device=env.device)
+        flat_deadzone = 0.02  # hip 侧展关节保持严格垂直
     else:
         stand_target = q_def
+        flat_deadzone = 0.10  # thigh/calf 关节留出 0.10 rad 死区供重负载下平移质心均载
 
     _, slope_sin = compute_foot_projected_terrain_normal(env, target_height, scan_sensor_names)
     excess_sin = torch.clamp(slope_sin - deadzone_sin, min=0.0)
     adapt_decay = torch.exp(-torch.pow(excess_sin / char_slope_sin, 3.0))
 
-    posture_deadzone = (max_angle_deadzone * (1.0 - adapt_decay)).unsqueeze(-1)
+    posture_deadzone = (
+        flat_deadzone + (max_angle_deadzone - flat_deadzone) * (1.0 - adapt_decay)
+    ).unsqueeze(-1)
     stand_diff = torch.clamp(torch.abs(q_curr - stand_target) - posture_deadzone, min=0.0)
     reward_stand = torch.linalg.norm(stand_diff, dim=1)
 
     effective_stand_scale = 1.0 + (stand_still_scale - 1.0) * adapt_decay
 
-    # 综合 (指令速度, 机身实际速度, 足端未归位偏差) 计算平滑过渡系数 alpha
-    active_motion = torch.maximum(torch.maximum(cmd, 0.7 * body_vel), adjust_motion)
+    # 刚收到0速指令但机身仍在减速滑行时 (body_vel > 0) 自然允许迈减速步；停稳后立即切入站立约束
+    active_motion = torch.maximum(cmd, 0.75 * body_vel)
     alpha = torch.clamp(active_motion / velocity_threshold, min=0.0, max=1.0)
     alpha = alpha * alpha * (3.0 - 2.0 * alpha)
 
@@ -450,29 +446,37 @@ def foot_clearance_reward(
     over_height_scale: float = 0.2,
     smooth_tau: float = 0.03,
 ) -> torch.Tensor:
-    """支持站立调整步的连续梯度非对称双边抬腿高度奖励"""
-    asset: RigidObject = env.scene[asset_cfg.name]
-    clearance = feet_height(env, scan_sensor_names, foot_radius)
+    """
+    严格对齐四足顺序且防 0 速抬腿作弊的摆动相抬腿高度奖励：
+    1. 显式按 [FL, FR, RL, RR] 顺序对齐刚体速度与激光测距，彻底消除前后腿错位相乘导致的前后步态不一致；
+    2. 仅在有速度指令或机身惯性尚未停稳时发放奖励，0速停稳后抬腿零奖励。
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    # 缓存与 scan_sensor_names ("fl", "fr", "rl", "rr") 严格一一对应的足端刚体索引
+    if not hasattr(env, "_ordered_foot_ids_for_clearance"):
+        prefixes = ("FL", "FR", "RL", "RR")
+        ordered_ids = [asset.find_bodies(f"{p}_foot")[0][0] for p in prefixes]
+        env._ordered_foot_ids_for_clearance = torch.tensor(ordered_ids, device=env.device, dtype=torch.long)
+
+    foot_ids = env._ordered_foot_ids_for_clearance
+    clearance = feet_height(env, scan_sensor_names, foot_radius)  # [N, 4] 顺序为 FL, FR, RL, RR
     diff = clearance - target_height
 
     smooth_weight = over_height_scale + (1.0 - over_height_scale) * torch.sigmoid(-diff / smooth_tau)
     foot_z_target_error = smooth_weight * torch.square(diff)
 
     foot_velocity_tanh = torch.tanh(
-        tanh_mult * torch.norm(asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2], dim=2)
+        tanh_mult * torch.norm(asset.data.body_lin_vel_w[:, foot_ids, :2], dim=2)
     )
     command_norm = torch.norm(env.command_manager.get_command(command_name)[:, :3], dim=1)
+    body_vel = (
+        torch.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+        + 0.5 * torch.abs(asset.data.root_ang_vel_b[:, 2])
+    )
 
-    # 若虽然指令为 0，但足端偏离髋部正下方超过 8cm（正在迈调整步），同样保留抬腿高度奖励！
-    if hasattr(env, "_stand_balance_indices_cache"):
-        thigh_ids, foot_ids, _ = env._stand_balance_indices_cache
-        max_offset = torch.amax(
-            torch.linalg.norm(asset.data.body_pos_w[:, foot_ids, :2] - asset.data.body_pos_w[:, thigh_ids, :2], dim=-1),
-            dim=-1,
-        )
-        need_stepping = (command_norm > 0.1) | (max_offset > 0.08)
-    else:
-        need_stepping = command_norm > 0.1
+    # 仅在有移动指令或减速滑行期 (body_vel > 0.25) 奖励抬腿；停稳后严禁奖励原地抬腿
+    need_stepping = (command_norm > 0.1) | (body_vel > 0.25)
 
     reward = torch.sum(torch.exp(-foot_z_target_error / std) * foot_velocity_tanh, dim=1)
     return reward * need_stepping.float()
@@ -488,19 +492,40 @@ def feet_too_near(
     return (threshold - distance).clamp(min=0)
 
 
+# def feet_contact_without_cmd(
+#     env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, command_name: str = "base_velocity"
+# ) -> torch.Tensor:
+#     """
+#     奖励在没有命令时足端接触地面。
+#     """
+#     # asset: Articulation = env.scene[asset_cfg.name]
+#     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+#     is_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0
+
+#     command_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
+#     reward = torch.sum(is_contact, dim=-1).float()
+#     return reward * (command_norm < 0.1)
+
 def feet_contact_without_cmd(
     env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, command_name: str = "base_velocity"
 ) -> torch.Tensor:
     """
-    奖励在没有命令时足端接触地面。
+    奖励在 0 速指令下四足持续、稳定地踩实地面：
+    - 要求正压力 > 20N 且连续触地时间累积达 0.25s 才拿满奖励，彻底杜绝高频点地（刚触地就抬起）。
     """
-    # asset: Articulation = env.scene[asset_cfg.name]
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    is_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0
+    force_z = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2]
+    contact_time = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids]
 
-    command_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
-    reward = torch.sum(is_contact, dim=-1).float()
-    return reward * (command_norm < 0.1)
+    # 正压力饱和因子 (0~25N 平滑过渡到 1.0) * 连续触地时长因子 (持续踩实 0.25s 达到 1.0，一旦抬脚立即归 0)
+    force_factor = torch.clamp(force_z / 25.0, min=0.0, max=1.0)
+    hold_factor = torch.clamp(contact_time / 0.25, min=0.0, max=1.0)
+    foot_planted_score = force_factor * hold_factor
+
+    command_norm = torch.norm(env.command_manager.get_command(command_name)[:, :3], dim=1)
+    # 四足平均踩实得分 (范围 0.0 ~ 1.0)
+    reward = torch.mean(foot_planted_score, dim=-1)
+    return reward * (command_norm < 0.1).float()
 
 def feet_air_time_dynamic(
     env: ManagerBasedRLEnv,
@@ -639,53 +664,130 @@ def base_height(
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
 
+# def base_height_target_exp(
+#     env: ManagerBasedRLEnv, 
+#     target_height: float, 
+#     std: float = 0.05, 
+#     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+#     sensor_cfg: SceneEntityCfg | None = None,
+# ) -> torch.Tensor:
+#     """基于高斯响应的机身高度追踪"""
+#     """奖励机器人保持在指定高度。
+
+#     Note:
+#         For flat terrain, target height is in the world frame. For rough terrain,
+#         sensor readings can adjust the target height to account for the terrain.
+#     """
+#     # extract the used quantities (to enable type-hinting)
+#     asset: RigidObject = env.scene[asset_cfg.name]
+#     if sensor_cfg is not None: # 如果提供了传感器配置，使用传感器数据调整目标高度以适应地形
+#         sensor: RayCaster = env.scene[sensor_cfg.name]
+        
+#         ray_hits = sensor.data.ray_hits_w[..., 2]
+        
+#         # 过滤无效值（NaN、Inf、过大值），并将它们替换为NaN以便后续计算忽略
+#         valid_mask = ~torch.isnan(ray_hits) & ~torch.isinf(ray_hits) & (torch.abs(ray_hits) < 1e6) # 根据实际情况调整阈值
+#         ray_hits_masked = torch.where(valid_mask, ray_hits, torch.tensor(float('nan'), device=ray_hits.device)) # 将无效值替换为NaN，以便后续计算中自动忽略这些值
+        
+#         # 调整目标高度：当前目标高度 + 有效传感器读数的平均值（如果所有读数无效，则保持原目标高度不变）
+#         # 对有效读数取平均，忽略无效值（NaN）
+#         adjusted_heights = torch.nanmean(ray_hits_masked, dim=1)
+        
+#         # For environments where ALL points are invalid, nanmean returns NaN
+#         # Replace these with current robot height
+#         all_invalid_mask = torch.isnan(adjusted_heights)
+#         if all_invalid_mask.any():
+#             invalid_env_count = all_invalid_mask.sum().item()
+#             total_invalid_points = (~valid_mask).sum().item()
+#             print(f"[WARNING] base_height - {invalid_env_count} envs with all invalid points, total invalid: {total_invalid_points}/{ray_hits.numel()} ({total_invalid_points/ray_hits.numel():.2%})")
+#             # adjusted_heights[all_invalid_mask] = asset.data.root_link_pos_w[all_invalid_mask, 2] - target_height
+#             adjusted_heights[all_invalid_mask] = 0.0
+        
+#         adjusted_target_height = target_height + adjusted_heights
+#     else:
+#         # Use the provided target height directly for flat terrain
+#         adjusted_target_height = target_height
+    
+#     # 偏离目标高度时，奖励快速衰减至 0 (1.0 代表完美匹配)
+#     height_error = torch.square(asset.data.root_pos_w[:, 2] - adjusted_target_height)
+#     return torch.exp(-height_error / (2 * std ** 2))
+
 def base_height_target_exp(
-    env: ManagerBasedRLEnv, 
-    target_height: float, 
-    std: float = 0.05, 
+    env: ManagerBasedRLEnv,
+    target_height: float,
+    std: float = 0.06,
+    flat_tolerance: float = 0.04,       # 平地允许的微小步态起伏容差 (±4cm，即平地 0.76~0.84m 均满分)
+    max_crouch_drop: float = 0.14,      # 陡坡/高台阶下额外开放的最大运动空间下蹲量 (14cm)
+    min_safe_clearance: float = 0.48,   # 任何极端地形下绝不允许跌破的防触地绝对下限 (48cm)
+    deadzone_sin: float = 0.087,        # 5° 以内视为平地，不放宽下蹲下限
+    char_slope_sin: float = 0.28,       # 特征坡度尺度
+    scan_sensor_names: list[str] = ("fl_foot_scan", "fr_foot_scan", "rl_foot_scan", "rr_foot_scan"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     sensor_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
-    """基于高斯响应的机身高度追踪"""
-    """奖励机器人保持在指定高度。
-
-    Note:
-        For flat terrain, target height is in the world frame. For rough terrain,
-        sensor readings can adjust the target height to account for the terrain.
     """
-    # extract the used quantities (to enable type-hinting)
+    地形自适应平顶区间（Safe-Corridor）机身高度奖励：
+    - 平地 (<5°)：要求高度保持在 [target_height - 0.04, target_height + 0.04]，防止蹲走与触地；
+    - 陡坡与高台阶：根据四足投影平面法向量 cos(theta) 与台阶落差自动下调合格下限 h_min，
+      允许机器人主动降低重心以扩大腿部工作空间，在 [h_min, h_max] 区间内均获得满分 1.0。
+    """
     asset: RigidObject = env.scene[asset_cfg.name]
-    if sensor_cfg is not None: # 如果提供了传感器配置，使用传感器数据调整目标高度以适应地形
+
+    # 1. 计算腹部下方的地形基准高度 z_belly
+    if sensor_cfg is not None:
         sensor: RayCaster = env.scene[sensor_cfg.name]
-        
         ray_hits = sensor.data.ray_hits_w[..., 2]
-        
-        # 过滤无效值（NaN、Inf、过大值），并将它们替换为NaN以便后续计算忽略
-        valid_mask = ~torch.isnan(ray_hits) & ~torch.isinf(ray_hits) & (torch.abs(ray_hits) < 1e6) # 根据实际情况调整阈值
-        ray_hits_masked = torch.where(valid_mask, ray_hits, torch.tensor(float('nan'), device=ray_hits.device)) # 将无效值替换为NaN，以便后续计算中自动忽略这些值
-        
-        # 调整目标高度：当前目标高度 + 有效传感器读数的平均值（如果所有读数无效，则保持原目标高度不变）
-        # 对有效读数取平均，忽略无效值（NaN）
-        adjusted_heights = torch.nanmean(ray_hits_masked, dim=1)
-        
-        # For environments where ALL points are invalid, nanmean returns NaN
-        # Replace these with current robot height
-        all_invalid_mask = torch.isnan(adjusted_heights)
-        if all_invalid_mask.any():
-            invalid_env_count = all_invalid_mask.sum().item()
-            total_invalid_points = (~valid_mask).sum().item()
-            print(f"[WARNING] base_height - {invalid_env_count} envs with all invalid points, total invalid: {total_invalid_points}/{ray_hits.numel()} ({total_invalid_points/ray_hits.numel():.2%})")
-            # adjusted_heights[all_invalid_mask] = asset.data.root_link_pos_w[all_invalid_mask, 2] - target_height
-            adjusted_heights[all_invalid_mask] = 0.0
-        
-        adjusted_target_height = target_height + adjusted_heights
+        valid_mask = ~torch.isnan(ray_hits) & ~torch.isinf(ray_hits) & (torch.abs(ray_hits) < 1e6)
+        ray_hits_masked = torch.where(valid_mask, ray_hits, torch.tensor(float("nan"), device=ray_hits.device))
+        z_belly = torch.nanmean(ray_hits_masked, dim=1)
+        all_invalid = torch.isnan(z_belly)
+        if all_invalid.any():
+            z_belly[all_invalid] = asset.data.root_pos_w[all_invalid, 2] - target_height
     else:
-        # Use the provided target height directly for flat terrain
-        adjusted_target_height = target_height
-    
-    # 偏离目标高度时，奖励快速衰减至 0 (1.0 代表完美匹配)
-    height_error = torch.square(asset.data.root_pos_w[:, 2] - adjusted_target_height)
-    return torch.exp(-height_error / (2 * std ** 2))
+        z_belly = torch.zeros_like(asset.data.root_pos_w[:, 2])
+
+    # 2. 获取四足投影平面的法向量 normal_w 与综合坡度/台阶正弦值 slope_sin（直接复用每步缓存，零额外开销）
+    normal_w, slope_sin = compute_foot_projected_terrain_normal(env, target_height, scan_sensor_names)
+    cos_slope = torch.clamp(normal_w[:, 2], min=0.70, max=1.0)
+
+    # 结合四足激光高度均值，平滑跨台阶瞬间的地形基准跳变
+    foot_z_list = []
+    for name in scan_sensor_names:
+        if name in env.scene.sensors:
+            f_hit = env.scene.sensors[name].data.ray_hits_w[..., 2].squeeze(-1)
+            f_valid = ~torch.isnan(f_hit) & ~torch.isinf(f_hit) & (torch.abs(f_hit) < 1e3)
+            foot_z_list.append(torch.where(f_valid, f_hit, z_belly))
+    if len(foot_z_list) == 4:
+        z_feet_mean = torch.mean(torch.stack(foot_z_list, dim=-1), dim=-1)
+        # 取腹部地形与四足平均地形的加权值（既防台阶棱角刮肚皮，又消除单步阶跃突变）
+        terrain_ref_z = 0.6 * torch.maximum(z_belly, z_feet_mean) + 0.4 * z_feet_mean
+    else:
+        terrain_ref_z = z_belly
+
+    # 3. 计算随坡度/台阶高度自适应的合格高度区间 [h_min_rel, h_max_rel]
+    excess_sin = torch.clamp(slope_sin - deadzone_sin, min=0.0)
+    # 平地 (<5°) 时 terrain_crouch_factor = 0；陡坡/高台阶时平滑趋近 1.0
+    terrain_crouch_factor = 1.0 - torch.exp(-torch.pow(excess_sin / char_slope_sin, 2.0))
+
+    # 下限 h_min_rel：平地为 target_height - 0.04 (0.76m)；
+    # 爬坡/上楼时顺应 cos_slope 投影并额外开放 max_crouch_drop (0.14m) 的屈膝空间，但不低于 min_safe_clearance
+    h_min_rel = torch.clamp(
+        target_height * (1.0 - terrain_crouch_factor * (1.0 - cos_slope))
+        - flat_tolerance
+        - max_crouch_drop * terrain_crouch_factor,
+        min=min_safe_clearance,
+    )
+    # 上限 h_max_rel：保持标称高度 + 容差 (0.84m)
+    h_max_rel = torch.full_like(h_min_rel, target_height + flat_tolerance)
+
+    # 4. 计算当前机身相对地形的净高度，仅对超出 [h_min_rel, h_max_rel] 走廊的部分计算误差
+    cur_rel_height = asset.data.root_pos_w[:, 2] - terrain_ref_z
+    below_err = torch.clamp(h_min_rel - cur_rel_height, min=0.0)
+    above_err = torch.clamp(cur_rel_height - h_max_rel, min=0.0)
+
+    # 对过低（有触地风险）施加完整误差，对轻微过高施加 0.5 倍温和约束
+    height_error = torch.square(below_err) + 0.5 * torch.square(above_err)
+    return torch.exp(-height_error / (2.0 * (std ** 2)))
 
 # def sound_suppression_acc_per_foot(
 #     env: ManagerBasedRLEnv,
@@ -1245,76 +1347,76 @@ def low_speed(
     
 #     return penalty * is_stand_mask
 
-def stand_z_force_variance_penalty(
-    env: ManagerBasedRLEnv,
-    sensor_cfg: SceneEntityCfg,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    command_name: str = "base_velocity",
-    stand_threshold: float = 0.1,
-    min_foot_load_ratio: float = 0.15,
-    foot_align_tol: float = 0.06,
-) -> torch.Tensor:
-    """
-    仅基于【足端水平位置归位】与【四足垂直触地力均衡】的两阶段站立惩罚[cite: 1]：
-    1. 足端归位调整期（当存在足端偏离同侧 thigh 正下方超过 foot_align_tol 时）：
-       - settled_gate 自动衰减，暂时放宽单足悬空惩罚 (underload_penalty)，允许机器人抬脚迈出调整步；
-       - 施加触地加权的足端偏心惩罚：歪斜脚踩地时受全额惩罚，抬起迈向髋部正下方时惩罚降低 80%。
-    2. 四足均载锁定期（当四足均归位到 thigh 正下方 6cm 对称区内）：
-       - settled_gate -> 1.0，全额激活 10.0 * underload_penalty + ratio_variance[cite: 1]，锁定四足均匀承重。
-    """
-    asset: Articulation = env.scene[asset_cfg.name]
-    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+# def stand_z_force_variance_penalty(
+#     env: ManagerBasedRLEnv,
+#     sensor_cfg: SceneEntityCfg,
+#     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+#     command_name: str = "base_velocity",
+#     stand_threshold: float = 0.1,
+#     min_foot_load_ratio: float = 0.15,
+#     foot_align_tol: float = 0.06,
+# ) -> torch.Tensor:
+#     """
+#     仅基于【足端水平位置归位】与【四足垂直触地力均衡】的两阶段站立惩罚[cite: 1]：
+#     1. 足端归位调整期（当存在足端偏离同侧 thigh 正下方超过 foot_align_tol 时）：
+#        - settled_gate 自动衰减，暂时放宽单足悬空惩罚 (underload_penalty)，允许机器人抬脚迈出调整步；
+#        - 施加触地加权的足端偏心惩罚：歪斜脚踩地时受全额惩罚，抬起迈向髋部正下方时惩罚降低 80%。
+#     2. 四足均载锁定期（当四足均归位到 thigh 正下方 6cm 对称区内）：
+#        - settled_gate -> 1.0，全额激活 10.0 * underload_penalty + ratio_variance[cite: 1]，锁定四足均匀承重。
+#     """
+#     asset: Articulation = env.scene[asset_cfg.name]
+#     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
 
-    # 缓存四条腿 [FL, FR, RL, RR] 的 thigh 刚体索引、foot 刚体索引与接触传感器索引
-    if not hasattr(env, "_stand_balance_indices_cache"):
-        prefixes = ("FL", "FR", "RL", "RR")
-        thigh_ids = [asset.find_bodies(f"{p}_thigh")[0][0] for p in prefixes]
-        foot_ids = [asset.find_bodies(f"{p}_foot")[0][0] for p in prefixes]
-        sensor_foot_ids = [contact_sensor.find_bodies(f"{p}_foot")[0][0] for p in prefixes]
-        env._stand_balance_indices_cache = (
-            torch.tensor(thigh_ids, device=env.device, dtype=torch.long),
-            torch.tensor(foot_ids, device=env.device, dtype=torch.long),
-            torch.tensor(sensor_foot_ids, device=env.device, dtype=torch.long),
-        )
-    thigh_ids, foot_ids, sensor_foot_ids = env._stand_balance_indices_cache
+#     # 缓存四条腿 [FL, FR, RL, RR] 的 thigh 刚体索引、foot 刚体索引与接触传感器索引
+#     if not hasattr(env, "_stand_balance_indices_cache"):
+#         prefixes = ("FL", "FR", "RL", "RR")
+#         thigh_ids = [asset.find_bodies(f"{p}_thigh")[0][0] for p in prefixes]
+#         foot_ids = [asset.find_bodies(f"{p}_foot")[0][0] for p in prefixes]
+#         sensor_foot_ids = [contact_sensor.find_bodies(f"{p}_foot")[0][0] for p in prefixes]
+#         env._stand_balance_indices_cache = (
+#             torch.tensor(thigh_ids, device=env.device, dtype=torch.long),
+#             torch.tensor(foot_ids, device=env.device, dtype=torch.long),
+#             torch.tensor(sensor_foot_ids, device=env.device, dtype=torch.long),
+#         )
+#     thigh_ids, foot_ids, sensor_foot_ids = env._stand_balance_indices_cache
 
-    # 1. 计算每只脚相对于同侧大腿根部 (thigh) 在世界水平面 (World XY) 的偏心距离 [N, 4]
-    foot_xy_w = asset.data.body_pos_w[:, foot_ids, :2]    # [N, 4, 2]
-    thigh_xy_w = asset.data.body_pos_w[:, thigh_ids, :2]  # [N, 4, 2]
-    foot_offset_xy = torch.linalg.norm(foot_xy_w - thigh_xy_w, dim=-1)  # [N, 4]
-    excess_offset = torch.clamp(foot_offset_xy - foot_align_tol, min=0.0)
+#     # 1. 计算每只脚相对于同侧大腿根部 (thigh) 在世界水平面 (World XY) 的偏心距离 [N, 4]
+#     foot_xy_w = asset.data.body_pos_w[:, foot_ids, :2]    # [N, 4, 2]
+#     thigh_xy_w = asset.data.body_pos_w[:, thigh_ids, :2]  # [N, 4, 2]
+#     foot_offset_xy = torch.linalg.norm(foot_xy_w - thigh_xy_w, dim=-1)  # [N, 4]
+#     excess_offset = torch.clamp(foot_offset_xy - foot_align_tol, min=0.0)
 
-    # 2. 获取四足 Z 轴正压力并归一化为承重比例 [0.0 ~ 1.0][cite: 1]
-    force_z = torch.clamp(contact_sensor.data.net_forces_w[:, sensor_foot_ids, 2], min=0.0)
-    total_force_z = torch.sum(force_z, dim=-1, keepdim=True)
-    force_ratio = force_z / (total_force_z + 1e-3)
+#     # 2. 获取四足 Z 轴正压力并归一化为承重比例 [0.0 ~ 1.0][cite: 1]
+#     force_z = torch.clamp(contact_sensor.data.net_forces_w[:, sensor_foot_ids, 2], min=0.0)
+#     total_force_z = torch.sum(force_z, dim=-1, keepdim=True)
+#     force_ratio = force_z / (total_force_z + 1e-3)
 
-    # 3. 触地加权的足端偏心惩罚（引导抬起偏离髋部正下方的脚并收回对称位置）
-    contact_weight = 0.2 + 0.8 * torch.sigmoid((force_z - 20.0) / 8.0)
-    foot_misalign_penalty = 8.0 * torch.sum(contact_weight * torch.square(excess_offset), dim=-1)
+#     # 3. 触地加权的足端偏心惩罚（引导抬起偏离髋部正下方的脚并收回对称位置）
+#     contact_weight = 0.2 + 0.8 * torch.sigmoid((force_z - 20.0) / 8.0)
+#     foot_misalign_penalty = 8.0 * torch.sum(contact_weight * torch.square(excess_offset), dim=-1)
 
-    # 4. 就位门控 settled_gate：仅根据四足最大水平偏心量计算
-    #    未归位时放开 underload_penalty 允许迈步调整；归位后 (excess_offset -> 0) 门控升至 1.0 锁定四足承重
-    max_excess_offset = torch.amax(excess_offset, dim=-1)
-    settled_gate = torch.exp(-25.0 * torch.square(max_excess_offset))
+#     # 4. 就位门控 settled_gate：仅根据四足最大水平偏心量计算
+#     #    未归位时放开 underload_penalty 允许迈步调整；归位后 (excess_offset -> 0) 门控升至 1.0 锁定四足承重
+#     max_excess_offset = torch.amax(excess_offset, dim=-1)
+#     settled_gate = torch.exp(-25.0 * torch.square(max_excess_offset))
 
-    # 5. 四足正压力均布与防腾空惩罚[cite: 1]
-    underload_penalty = torch.sum(torch.square(torch.clamp(min_foot_load_ratio - force_ratio, min=0.0)), dim=-1)
-    ratio_variance = torch.var(force_ratio, dim=-1, correction=0)
-    no_support_penalty = (total_force_z.squeeze(-1) < 10.0).float()
+#     # 5. 四足正压力均布与防腾空惩罚[cite: 1]
+#     underload_penalty = torch.sum(torch.square(torch.clamp(min_foot_load_ratio - force_ratio, min=0.0)), dim=-1)
+#     ratio_variance = torch.var(force_ratio, dim=-1, correction=0)
+#     no_support_penalty = (total_force_z.squeeze(-1) < 10.0).float()
 
-    penalty = (
-        foot_misalign_penalty
-        + settled_gate * (10.0 * underload_penalty + ratio_variance)
-        + no_support_penalty
-    )
+#     penalty = (
+#         foot_misalign_penalty
+#         + settled_gate * (10.0 * underload_penalty + ratio_variance)
+#         + no_support_penalty
+#     )
 
-    # 6. 仅在站立指令下生效[cite: 1]
-    commands = env.command_manager.get_command(command_name)
-    cmd_norm = torch.linalg.norm(commands[:, :3], dim=1)
-    is_stand_mask = (cmd_norm < stand_threshold).float()
+#     # 6. 仅在站立指令下生效[cite: 1]
+#     commands = env.command_manager.get_command(command_name)
+#     cmd_norm = torch.linalg.norm(commands[:, :3], dim=1)
+#     is_stand_mask = (cmd_norm < stand_threshold).float()
 
-    return penalty * is_stand_mask
+#     return penalty * is_stand_mask
 
 # def stand_z_force_variance_penalty(
 #     env: ManagerBasedRLEnv, 
@@ -1345,6 +1447,161 @@ def stand_z_force_variance_penalty(
     
 #     # 返回最终惩罚
 #     return absolute_variance * is_stand_mask
+
+# def stand_z_force_variance_penalty(
+#     env: ManagerBasedRLEnv,
+#     sensor_cfg: SceneEntityCfg,
+#     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+#     command_name: str = "base_velocity",
+#     stand_threshold: float = 0.15,
+#     min_foot_load_ratio: float = 0.16,
+#     max_foot_load_ratio: float = 0.32,  # 单脚最大允许承重比（理想均值为 0.25）
+#     foot_align_tol: float = 0.08,       # 放宽水平偏心容差至 8cm，允许偏心负载下微调重心
+# ) -> torch.Tensor:
+#     asset: Articulation = env.scene[asset_cfg.name]
+#     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+#     if not hasattr(env, "_stand_balance_indices_cache"):
+#         prefixes = ("FL", "FR", "RL", "RR")
+#         thigh_ids = [asset.find_bodies(f"{p}_thigh")[0][0] for p in prefixes]
+#         foot_ids = [asset.find_bodies(f"{p}_foot")[0][0] for p in prefixes]
+#         sensor_foot_ids = [contact_sensor.find_bodies(f"{p}_foot")[0][0] for p in prefixes]
+#         env._stand_balance_indices_cache = (
+#             torch.tensor(thigh_ids, device=env.device, dtype=torch.long),
+#             torch.tensor(foot_ids, device=env.device, dtype=torch.long),
+#             torch.tensor(sensor_foot_ids, device=env.device, dtype=torch.long),
+#         )
+#     thigh_ids, foot_ids, sensor_foot_ids = env._stand_balance_indices_cache
+
+#     foot_xy_w = asset.data.body_pos_w[:, foot_ids, :2]
+#     thigh_xy_w = asset.data.body_pos_w[:, thigh_ids, :2]
+#     foot_offset_xy = torch.linalg.norm(foot_xy_w - thigh_xy_w, dim=-1)
+#     excess_offset = torch.clamp(foot_offset_xy - foot_align_tol, min=0.0)
+
+#     # 获取四足 Z 轴正压力并计算承重比例 [N, 4]
+#     force_z = torch.clamp(contact_sensor.data.net_forces_w[:, sensor_foot_ids, 2], min=0.0)
+#     total_force_z = torch.sum(force_z, dim=-1, keepdim=True)
+#     force_ratio = force_z / (total_force_z + 1e-3)
+
+#     # 缓存当前四足承重极差，供 joint_position_penalty 和 foot_clearance_reward 解锁迈步使用
+#     env._foot_force_imbalance = torch.amax(force_ratio, dim=-1) - torch.amin(force_ratio, dim=-1)
+
+#     contact_weight = 0.2 + 0.8 * torch.sigmoid((force_z - 20.0) / 8.0)
+#     foot_misalign_penalty = 6.0 * torch.sum(contact_weight * torch.square(excess_offset), dim=-1)
+
+#     max_excess_offset = torch.amax(excess_offset, dim=-1)
+#     settled_gate = torch.exp(-20.0 * torch.square(max_excess_offset))
+
+#     # 1. 欠载惩罚 (< 16%) 与 过载强惩罚 (> 32%)
+#     underload_penalty = torch.sum(torch.square(torch.clamp(min_foot_load_ratio - force_ratio, min=0.0)), dim=-1)
+#     overload_penalty = torch.sum(torch.square(torch.clamp(force_ratio - max_foot_load_ratio, min=0.0)), dim=-1)
+
+#     # 2. 将方差权重提升至 25.0，提供充足梯度迫使机器人移动质心均摊重力
+#     ratio_variance = torch.var(force_ratio, dim=-1, correction=0)
+#     no_support_penalty = (total_force_z.squeeze(-1) < 10.0).float()
+
+#     # 注意：overload_penalty 不乘 settled_gate，一旦单腿过载立即全额惩罚！
+#     penalty = (
+#         foot_misalign_penalty
+#         + 20.0 * overload_penalty
+#         + settled_gate * (12.0 * underload_penalty + 25.0 * ratio_variance)
+#         + no_support_penalty
+#     )
+
+#     commands = env.command_manager.get_command(command_name)
+#     cmd_norm = torch.linalg.norm(commands[:, :3], dim=1)
+#     is_stand_mask = (cmd_norm < stand_threshold).float()
+
+#     return penalty * is_stand_mask
+
+def stand_z_force_variance_penalty(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    command_name: str = "base_velocity",
+    stand_threshold: float = 0.1,
+    min_foot_load_ratio: float = 0.16,
+    max_foot_load_ratio: float = 0.34,
+    foot_align_tol: float = 0.12,
+    max_stance_time_s: float = 0.65,
+) -> torch.Tensor:
+    """
+    全工况足端载荷均衡与防悬空/防卡死惩罚：
+    1. 站立态 (cmd < 0.1)：
+       - 移除 contact_weight 阶跃与 settled_gate 折扣，杜绝“触地即抬”与“伸腿逃避欠载惩罚”；
+       - 同时惩罚单腿欠载 (<16%)、单腿过载 (>34%)、四足承重比方差及任何足端离地/弹跳行为；
+    2. 行进态 (cmd >= 0.1)：
+       - 惩罚单腿连续触地超过 0.65s 的拖步/卡死行为，强迫周期性换腿卸载以冷却驱动器低通滤波器。
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    if not hasattr(env, "_stand_balance_indices_cache"):
+        prefixes = ("FL", "FR", "RL", "RR")
+        thigh_ids = [asset.find_bodies(f"{p}_thigh")[0][0] for p in prefixes]
+        foot_ids = [asset.find_bodies(f"{p}_foot")[0][0] for p in prefixes]
+        sensor_foot_ids = [contact_sensor.find_bodies(f"{p}_foot")[0][0] for p in prefixes]
+        env._stand_balance_indices_cache = (
+            torch.tensor(thigh_ids, device=env.device, dtype=torch.long),
+            torch.tensor(foot_ids, device=env.device, dtype=torch.long),
+            torch.tensor(sensor_foot_ids, device=env.device, dtype=torch.long),
+        )
+    thigh_ids, foot_ids, sensor_foot_ids = env._stand_balance_indices_cache
+
+    # 1. 恒定权重的足端水平过偏惩罚（包容前膝后肘 12cm 标称连杆偏移，触地与空中权重一致，防触地反弹）
+    foot_xy_w = asset.data.body_pos_w[:, foot_ids, :2]
+    thigh_xy_w = asset.data.body_pos_w[:, thigh_ids, :2]
+    foot_offset_xy = torch.linalg.norm(foot_xy_w - thigh_xy_w, dim=-1)
+    excess_offset = torch.clamp(foot_offset_xy - foot_align_tol, min=0.0)
+    foot_misalign_penalty = 3.0 * torch.sum(torch.square(excess_offset), dim=-1)
+
+    # 2. 获取四足 Z 轴正压力与承重比例 [N, 4]
+    force_z = torch.clamp(contact_sensor.data.net_forces_w[:, sensor_foot_ids, 2], min=0.0)
+    total_force_z = torch.sum(force_z, dim=-1, keepdim=True)
+    force_ratio = force_z / (total_force_z + 1e-3)
+
+    # 3. 站立防悬空与防颠脚惩罚：任何脚正压力 < 25N、存在腾空时间或垂直乱动，立即受罚
+    unloaded_foot = torch.clamp((25.0 - force_z) / 25.0, min=0.0, max=1.0)
+    air_time = torch.clamp(contact_sensor.data.current_air_time[:, sensor_foot_ids], min=0.0, max=0.5)
+    foot_vel_z = torch.abs(asset.data.body_lin_vel_w[:, foot_ids, 2])
+    airborne_penalty = 0.4 * torch.sum(
+        torch.square(unloaded_foot) + 2.0 * air_time + 0.5 * torch.square(foot_vel_z), dim=-1
+    )
+
+    # 4. 四足欠载 (<16%)、过载 (>34%) 与方差惩罚（100% 生效，迫使机身移动质心均摊重物）
+    underload_penalty = torch.sum(torch.square(torch.clamp(min_foot_load_ratio - force_ratio, min=0.0)), dim=-1)
+    overload_penalty = torch.sum(torch.square(torch.clamp(force_ratio - max_foot_load_ratio, min=0.0)), dim=-1)
+    ratio_variance = torch.var(force_ratio, dim=-1, correction=0)
+    no_support_penalty = (total_force_z.squeeze(-1) < 10.0).float()
+
+    stand_raw_pen = (
+        foot_misalign_penalty
+        + airborne_penalty
+        + 8.0 * underload_penalty
+        + 10.0 * overload_penalty
+        + 6.0 * ratio_variance
+        + no_support_penalty
+    )
+
+    commands = env.command_manager.get_command(command_name)
+    cmd_norm = torch.linalg.norm(commands[:, :3], dim=1)
+    body_speed = (
+        torch.linalg.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+        + 0.5 * torch.abs(asset.data.root_ang_vel_b[:, 2])
+    )
+
+    # 站立门控：给刚收到0速指令留出减速收脚窗口 (body_speed < 0.35 -> 0.10 平滑切入)
+    stop_gate = torch.clamp((0.35 - body_speed) / 0.25, min=0.0, max=1.0)
+    stand_pen = torch.clamp(stand_raw_pen, max=2.0) * (cmd_norm < stand_threshold).float() * stop_gate
+
+    # 5. 行进间防单腿久撑惩罚：限制单次触地不超过 0.65s，防止爬坡卡腿导致驱动器积分进入 PL[2] 保护
+    contact_time = contact_sensor.data.current_contact_time[:, sensor_foot_ids]
+    stance_stall_pen = torch.sum(torch.square(torch.clamp(contact_time - max_stance_time_s, min=0.0, max=1.5)), dim=-1)
+    move_pen = 0.4 * stance_stall_pen * (cmd_norm >= stand_threshold).float()
+
+    # 出生前 40 步 (0.8s) 恢复豁免，防触地自杀
+    spawn_mask = (env.episode_length_buf > 40).float()
+    return spawn_mask * (stand_pen + move_pen)
 
 def base_z_acceleration_penalty(
     env: ManagerBasedRLEnv,  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
@@ -1499,27 +1756,201 @@ def track_lin_vel_xy_exp(
 
 #     return over_rating_l2 + base_torque_l2
 
+# def joint_torques_over_rating_l2(
+#     env: ManagerBasedRLEnv,
+#     ratings: list[float] | dict[str, float],
+#     max_over_time_s: float = 3.0,
+#     cool_down_rate: float = 1.5,
+#     soft_ratio: float = 0.95,
+#     base_l2_coef: float = 0.02,
+#     time_escalation_gain: float = 40.0,
+#     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+# ) -> torch.Tensor:
+#     """
+#     贴合电机驱动器 3s 过载保护特性的动态扭矩奖惩函数：
+#     1. 额定扭矩内 (ratio <= 1.0)：仅保留极微弱的均值平方项 (base_l2_coef)，体现“不超过额定更优”，且按关节取平均 (mean) 避免 12 倍累加膨胀；
+#     2. 短时超额 (< 0.5s)：当关节在单步支撑相瞬时超过额定扭矩时，计时器 t_over 很小，惩罚极轻，允许短时爆发蹬地；
+#     3. 持续超额逼近 (t_over -> max_over_time_s)：
+#        - 超额时按发热倍率累加时间，未超额（如摆动相或卸载后）按 cool_down_rate 快速冷却清零；
+#        - 惩罚权重随 (t_over / max_over_time_s)^2 动态放大 time_escalation_gain (40倍)，并对 滑动热积分 (I^2*t EMA) 超限施加陡峭惩罚。
+#     """
+#     asset: Articulation = env.scene[asset_cfg.name]
+
+#     # 1. 首次调用时解析并缓存额定扭矩张量 [num_joints]
+#     cache_key = f"_torque_ratings_cache_{id(ratings)}"
+#     if not hasattr(env, cache_key):
+#         if isinstance(ratings, dict):
+#             rating_tensor = torch.ones(asset.num_joints, device=env.device, dtype=torch.float32) * 420.0
+#             for pattern, val in ratings.items():
+#                 j_ids, _ = asset.find_joints(pattern)
+#                 rating_tensor[j_ids] = float(val)
+#         else:
+#             rating_tensor = torch.tensor(ratings, device=env.device, dtype=torch.float32)
+#         setattr(env, cache_key, torch.clamp(rating_tensor, min=1.0))
+
+#     rated_torques = getattr(env, cache_key)[asset_cfg.joint_ids]
+#     applied_torques = torch.abs(asset.data.applied_torque[:, asset_cfg.joint_ids])
+#     num_j = applied_torques.shape[1]
+
+#     # 计算每个关节相对于额定扭矩的负载率: ratio = |tau| / tau_rated
+#     torque_ratio = applied_torques / rated_torques  # [num_envs, num_joints]
+
+#     # 2. 初始化或重置每个关节的【连续超额计时器 (秒)】与【3秒热负载 I^2*t EMA】
+#     if not hasattr(env, "_joint_over_torque_time_s") or env._joint_over_torque_time_s.shape != torque_ratio.shape:
+#         env._joint_over_torque_time_s = torch.zeros_like(torque_ratio)
+#         env._joint_thermal_i2t_ema = torch.zeros_like(torque_ratio)
+
+#     # 对刚发生 Reset 的环境清零计时器与热积分
+#     reset_mask = env.episode_length_buf <= 1
+#     if reset_mask.any():
+#         env._joint_over_torque_time_s[reset_mask] = 0.0
+#         env._joint_thermal_i2t_ema[reset_mask] = 0.0
+
+#     # 3. 更新连续超额计时器 (模拟驱动器过载保护计时)
+#     dt = env.step_dt
+#     is_over = torque_ratio > 1.0
+#     # 超额时：基础按 1:1 计时，若严重超额 (如 1.5倍额定) 则按过载幅度加速计时；
+#     # 未超额时：按 cool_down_rate (默认1.5倍速) 冷却衰减，正常步态摆动相可迅速清零计时器
+#     time_delta = torch.where(
+#         is_over,
+#         dt * (1.0 + 2.0 * torch.clamp(torque_ratio.detach() - 1.0, min=0.0, max=1.0)),
+#         -dt * cool_down_rate * torch.clamp(1.0 - torque_ratio.detach(), min=0.2, max=1.0),
+#     )
+#     env._joint_over_torque_time_s = torch.clamp(
+#         env._joint_over_torque_time_s + time_delta, min=0.0, max=max_over_time_s
+#     )
+
+#     # 4. 更新 3秒窗口的 I^2*t 热负载 EMA (平滑检测跨步态周期的持续高负载)
+#     alpha = dt / max(max_over_time_s, dt)
+#     ratio_sq = torch.square(torque_ratio)
+#     thermal_ema_curr = (1.0 - alpha) * env._joint_thermal_i2t_ema.detach() + alpha * ratio_sq
+#     env._joint_thermal_i2t_ema = thermal_ema_curr.detach()
+
+#     # 5. 计算三层分级惩罚（对关节维度使用 mean 而非 sum，确保数值量级稳定可控）
+#     # (a) 平时温和偏好项：鼓励扭矩尽量保持在额定值以下，引导四腿均摊负载
+#     mild_base_pen = base_l2_coef * torch.mean(ratio_sq, dim=1)
+
+#     # (b) 随超额时间 (0 -> 3s) 急剧放大的超额惩罚：
+#     #     t_over = 0.1s 时放大系数仅为 1.04（允许短时超额）；
+#     #     t_over = 2.5s 时放大系数激增至 1 + 40 * (2.5/3.0)^2 = 28.8 倍！
+#     norm_time = env._joint_over_torque_time_s / max_over_time_s  # [0, 1]
+#     time_multiplier = 1.0 + time_escalation_gain * torch.square(norm_time)
+#     over_amount = torch.clamp(torque_ratio - soft_ratio, min=0.0)
+#     escalating_over_pen = torch.mean(time_multiplier * torch.square(over_amount), dim=1)
+
+#     # (c) 3秒持续热过载屏障项：当 3s 平均热负载突破额定值 (thermal_ema > 1.0) 或计时器超过 2.0s 时强力拉升
+#     thermal_over = torch.clamp(thermal_ema_curr - 0.95, min=0.0)
+#     near_trip_barrier = torch.clamp(norm_time - 0.65, min=0.0) * torque_ratio  # 超过 2.0s (65% 保护时间) 触发强梯度
+#     protection_barrier_pen = 5.0 * torch.mean(
+#         torch.square(thermal_over) + torch.square(near_trip_barrier), dim=1
+#     )
+
+#     return mild_base_pen + escalating_over_pen + protection_barrier_pen
+
+
+# def joint_torques_over_rating_l2(
+#     env: ManagerBasedRLEnv,
+#     ratings: list[float] | dict[str, float],
+#     max_over_time_s: float = 3.0,
+#     cool_down_rate: float = 1.0,
+#     soft_ratio: float = 0.78,            # 78% 额定扭矩起算平滑超额
+#     continuous_safe_ratio: float = 0.82, # 82% 额定扭矩即启动 3s 热保护累加计时器
+#     base_l2_coef: float = 0.05,
+#     leg_balance_coef: float = 0.5,       # 新增：四腿同名关节扭矩均载权重
+#     time_escalation_gain: float = 50.0,
+#     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+# ) -> torch.Tensor:
+#     asset: Articulation = env.scene[asset_cfg.name]
+
+#     # 1. 首次调用时解析额定扭矩张量并缓存 Thigh / Calf 关节索引分组
+#     cache_key = f"_torque_ratings_cache_{id(ratings)}"
+#     if not hasattr(env, cache_key):
+#         if isinstance(ratings, dict):
+#             rating_tensor = torch.ones(asset.num_joints, device=env.device, dtype=torch.float32) * 420.0
+#             for pattern, val in ratings.items():
+#                 j_ids, _ = asset.find_joints(pattern)
+#                 rating_tensor[j_ids] = float(val)
+#         else:
+#             rating_tensor = torch.tensor(ratings, device=env.device, dtype=torch.float32)
+#         setattr(env, cache_key, torch.clamp(rating_tensor, min=1.0))
+
+#         thigh_ids, _ = asset.find_joints(".*_thigh_joint")
+#         calf_ids, _ = asset.find_joints(".*_calf_joint")
+#         env._torque_balance_group_ids = (thigh_ids, calf_ids)
+
+#     rated_torques = getattr(env, cache_key)[asset_cfg.joint_ids]
+#     applied_torques = torch.abs(asset.data.applied_torque[:, asset_cfg.joint_ids])
+#     torque_ratio = applied_torques / rated_torques  # [num_envs, num_joints]
+
+#     # 2. 初始化或重置每个关节的【连续超额计时器】与【热负载 I^2*t EMA】
+#     if not hasattr(env, "_joint_over_torque_time_s") or env._joint_over_torque_time_s.shape != torque_ratio.shape:
+#         env._joint_over_torque_time_s = torch.zeros_like(torque_ratio)
+#         env._joint_thermal_i2t_ema = torch.zeros_like(torque_ratio)
+
+#     reset_mask = env.episode_length_buf <= 1
+#     if reset_mask.any():
+#         env._joint_over_torque_time_s[reset_mask] = 0.0
+#         env._joint_thermal_i2t_ema[reset_mask] = 0.0
+
+#     # 3. 降额启动计时器：超过 continuous_safe_ratio (82%) 即开始累加时间，防止实机卡在临界点保护
+#     dt = env.step_dt
+#     is_over = torque_ratio > continuous_safe_ratio
+#     time_delta = torch.where(
+#         is_over,
+#         dt * (1.0 + 3.0 * torch.clamp(torque_ratio.detach() - continuous_safe_ratio, min=0.0, max=1.0)),
+#         -dt * cool_down_rate * torch.clamp(continuous_safe_ratio - torque_ratio.detach(), min=0.1, max=1.0),
+#     )
+#     env._joint_over_torque_time_s = torch.clamp(
+#         env._joint_over_torque_time_s + time_delta, min=0.0, max=max_over_time_s
+#     )
+
+#     # 4. 更新 3秒窗口的 I^2*t 热负载 EMA
+#     alpha = dt / max(max_over_time_s, dt)
+#     ratio_sq = torch.square(torque_ratio)
+#     thermal_ema_curr = (1.0 - alpha) * env._joint_thermal_i2t_ema.detach() + alpha * ratio_sq
+#     env._joint_thermal_i2t_ema = thermal_ema_curr.detach()
+
+#     # 5. 计算四腿同名关节（4个Thigh、4个Calf）的扭矩负载率方差，直接消除单腿偏载
+#     thigh_ids, calf_ids = env._torque_balance_group_ids
+#     thigh_var = torch.var(torque_ratio[:, thigh_ids], dim=1, correction=0)
+#     calf_var = torch.var(torque_ratio[:, calf_ids], dim=1, correction=0)
+#     leg_torque_var_pen = leg_balance_coef * (thigh_var + calf_var)
+
+#     # 6. 采用 [0.7 * 最差单关节(amax) + 0.3 * 全关节均值(mean)]，防止单关节过载被 12 关节平均稀释
+#     mild_base_pen = base_l2_coef * (0.5 * torch.amax(ratio_sq, dim=1) + 0.5 * torch.mean(ratio_sq, dim=1))
+
+#     norm_time = env._joint_over_torque_time_s / max_over_time_s
+#     time_multiplier = 1.0 + time_escalation_gain * torch.square(norm_time)
+#     over_amount = torch.clamp(torque_ratio - soft_ratio, min=0.0)
+#     joint_over_pen = time_multiplier * torch.square(over_amount)
+#     escalating_over_pen = 0.7 * torch.amax(joint_over_pen, dim=1) + 0.3 * torch.mean(joint_over_pen, dim=1)
+
+#     # 7. 持续热过载屏障项（针对 80% 降额基准设定触发点）
+#     thermal_over = torch.clamp(thermal_ema_curr - (continuous_safe_ratio ** 2), min=0.0)
+#     near_trip_barrier = torch.clamp(norm_time - 0.50, min=0.0) * torque_ratio
+#     barrier_per_joint = torch.square(thermal_over) + torch.square(near_trip_barrier)
+#     protection_barrier_pen = 8.0 * (0.7 * torch.amax(barrier_per_joint, dim=1) + 0.3 * torch.mean(barrier_per_joint, dim=1))
+
+#     return mild_base_pen + leg_torque_var_pen + escalating_over_pen + protection_barrier_pen
+
+
+
 def joint_torques_over_rating_l2(
     env: ManagerBasedRLEnv,
     ratings: list[float] | dict[str, float],
-    max_over_time_s: float = 3.0,
-    cool_down_rate: float = 1.5,
-    soft_ratio: float = 0.95,
-    base_l2_coef: float = 0.02,
-    time_escalation_gain: float = 40.0,
+    soft_ratio: float = 0.72,
+    base_l2_coef: float = 0.04,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
-    贴合电机驱动器 3s 过载保护特性的动态扭矩奖惩函数：
-    1. 额定扭矩内 (ratio <= 1.0)：仅保留极微弱的均值平方项 (base_l2_coef)，体现“不超过额定更优”，且按关节取平均 (mean) 避免 12 倍累加膨胀；
-    2. 短时超额 (< 0.5s)：当关节在单步支撑相瞬时超过额定扭矩时，计时器 t_over 很小，惩罚极轻，允许短时爆发蹬地；
-    3. 持续超额逼近 (t_over -> max_over_time_s)：
-       - 超额时按发热倍率累加时间，未超额（如摆动相或卸载后）按 cool_down_rate 快速冷却清零；
-       - 惩罚权重随 (t_over / max_over_time_s)^2 动态放大 time_escalation_gain (40倍)，并对 滑动热积分 (I^2*t EMA) 超限施加陡峭惩罚。
+    无状态（Markovian）防驱动器 PL[2] 限流扭矩惩罚：
+    1. 将软阈值设在 72% CL[1]（低于驱动器 90% CL[1] 的迟滞恢复阈值 THOLD 并预留 Sim2Real 安全裕度）；
+    2. 采用 [0.65 * 单步最差关节(amax) + 0.35 * 全关节均值(mean)]，消除 12 关节平均稀释，
+       直接迫使过载最严重的单腿将负载分摊给其余三腿并优化膝关节力臂；
+    3. 零跨步计时器、带出生起立豁免与上限截断，极易收敛且不引发 base 触地自杀。
     """
     asset: Articulation = env.scene[asset_cfg.name]
 
-    # 1. 首次调用时解析并缓存额定扭矩张量 [num_joints]
     cache_key = f"_torque_ratings_cache_{id(ratings)}"
     if not hasattr(env, cache_key):
         if isinstance(ratings, dict):
@@ -1532,60 +1963,17 @@ def joint_torques_over_rating_l2(
         setattr(env, cache_key, torch.clamp(rating_tensor, min=1.0))
 
     rated_torques = getattr(env, cache_key)[asset_cfg.joint_ids]
-    applied_torques = torch.abs(asset.data.applied_torque[:, asset_cfg.joint_ids])
-    num_j = applied_torques.shape[1]
-
-    # 计算每个关节相对于额定扭矩的负载率: ratio = |tau| / tau_rated
-    torque_ratio = applied_torques / rated_torques  # [num_envs, num_joints]
-
-    # 2. 初始化或重置每个关节的【连续超额计时器 (秒)】与【3秒热负载 I^2*t EMA】
-    if not hasattr(env, "_joint_over_torque_time_s") or env._joint_over_torque_time_s.shape != torque_ratio.shape:
-        env._joint_over_torque_time_s = torch.zeros_like(torque_ratio)
-        env._joint_thermal_i2t_ema = torch.zeros_like(torque_ratio)
-
-    # 对刚发生 Reset 的环境清零计时器与热积分
-    reset_mask = env.episode_length_buf <= 1
-    if reset_mask.any():
-        env._joint_over_torque_time_s[reset_mask] = 0.0
-        env._joint_thermal_i2t_ema[reset_mask] = 0.0
-
-    # 3. 更新连续超额计时器 (模拟驱动器过载保护计时)
-    dt = env.step_dt
-    is_over = torque_ratio > 1.0
-    # 超额时：基础按 1:1 计时，若严重超额 (如 1.5倍额定) 则按过载幅度加速计时；
-    # 未超额时：按 cool_down_rate (默认1.5倍速) 冷却衰减，正常步态摆动相可迅速清零计时器
-    time_delta = torch.where(
-        is_over,
-        dt * (1.0 + 2.0 * torch.clamp(torque_ratio.detach() - 1.0, min=0.0, max=1.0)),
-        -dt * cool_down_rate * torch.clamp(1.0 - torque_ratio.detach(), min=0.2, max=1.0),
-    )
-    env._joint_over_torque_time_s = torch.clamp(
-        env._joint_over_torque_time_s + time_delta, min=0.0, max=max_over_time_s
-    )
-
-    # 4. 更新 3秒窗口的 I^2*t 热负载 EMA (平滑检测跨步态周期的持续高负载)
-    alpha = dt / max(max_over_time_s, dt)
+    torque_ratio = torch.abs(asset.data.applied_torque[:, asset_cfg.joint_ids]) / rated_torques
     ratio_sq = torch.square(torque_ratio)
-    thermal_ema_curr = (1.0 - alpha) * env._joint_thermal_i2t_ema.detach() + alpha * ratio_sq
-    env._joint_thermal_i2t_ema = thermal_ema_curr.detach()
 
-    # 5. 计算三层分级惩罚（对关节维度使用 mean 而非 sum，确保数值量级稳定可控）
-    # (a) 平时温和偏好项：鼓励扭矩尽量保持在额定值以下，引导四腿均摊负载
-    mild_base_pen = base_l2_coef * torch.mean(ratio_sq, dim=1)
+    # 1. 全时段均载与力臂优化项：最小化 amax(ratio^2) 天然引导四腿均摊扭矩
+    balance_pen = base_l2_coef * (0.65 * torch.amax(ratio_sq, dim=1) + 0.35 * torch.mean(ratio_sq, dim=1))
 
-    # (b) 随超额时间 (0 -> 3s) 急剧放大的超额惩罚：
-    #     t_over = 0.1s 时放大系数仅为 1.04（允许短时超额）；
-    #     t_over = 2.5s 时放大系数激增至 1 + 40 * (2.5/3.0)^2 = 28.8 倍！
-    norm_time = env._joint_over_torque_time_s / max_over_time_s  # [0, 1]
-    time_multiplier = 1.0 + time_escalation_gain * torch.square(norm_time)
-    over_amount = torch.clamp(torque_ratio - soft_ratio, min=0.0)
-    escalating_over_pen = torch.mean(time_multiplier * torch.square(over_amount), dim=1)
+    # 2. 72% 额定扭矩越界强梯度项：防止稳态扭矩接近驱动器 90% CL[1] 迟滞锁死区
+    over_soft = torch.clamp(torque_ratio - soft_ratio, min=0.0)
+    over_sq = torch.square(over_soft)
+    over_pen = 0.65 * torch.amax(over_sq, dim=1) + 0.35 * torch.mean(over_sq, dim=1)
 
-    # (c) 3秒持续热过载屏障项：当 3s 平均热负载突破额定值 (thermal_ema > 1.0) 或计时器超过 2.0s 时强力拉升
-    thermal_over = torch.clamp(thermal_ema_curr - 0.95, min=0.0)
-    near_trip_barrier = torch.clamp(norm_time - 0.65, min=0.0) * torque_ratio  # 超过 2.0s (65% 保护时间) 触发强梯度
-    protection_barrier_pen = 5.0 * torch.mean(
-        torch.square(thermal_over) + torch.square(near_trip_barrier), dim=1
-    )
-
-    return mild_base_pen + escalating_over_pen + protection_barrier_pen
+    # 出生前 30 步 (0.6s) 允许大扭矩撑起机身，且总输出截断在 2.0 以内保证收敛稳定
+    spawn_mask = (env.episode_length_buf > 30).float()
+    return torch.clamp(balance_pen + spawn_mask * over_pen, max=2.0)

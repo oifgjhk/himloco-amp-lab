@@ -217,7 +217,7 @@ class UniformLevelVelocityCommand(UniformVelocityCommand):
             if len(active_ids) > 0:
                 cfg_min = env_cfg_min[active_vx_mask]
                 cfg_max = env_cfg_max[active_vx_mask]
-                bound = torch.minimum(vel_low_bound[active_vx_mask], 0.6 * torch.maximum(cfg_max.abs(), cfg_min.abs()))
+                bound = torch.minimum(vel_low_bound[active_vx_mask], 0.6 * torch.minimum(cfg_max.abs(), cfg_min.abs()))
                 self.vel_command_b[active_ids, 0] = sample_disjoint_intervals(
                     active_ids, bound, cfg_min, cfg_max, self.device
                 )

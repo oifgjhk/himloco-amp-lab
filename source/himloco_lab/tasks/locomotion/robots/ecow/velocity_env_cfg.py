@@ -36,16 +36,16 @@ COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
     sub_terrains={
         "pyramid_stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
             proportion=0.1,
-            step_height_range=(0.0, 0.35),  # 0.05 + 0.18 * difficulty
+            step_height_range=(0.0, 0.25),  # 0.05 + 0.18 * difficulty
             step_width=0.30, 
-            platform_width=4.0, 
+            platform_width=3.0, 
             border_width=0.0,  
         ),
         "pyramid_stairs_inv": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
             proportion=0.15,
-            step_height_range=(0.0, 0.35),   #0.23
+            step_height_range=(0.0, 0.25),   #0.23
             step_width=0.30,
-            platform_width=4.0,
+            platform_width=3.0,
             border_width=0.0,  
         ),
         # "pyramid_stairs2": terrain_gen.MeshPyramidStairsTerrainCfg(
@@ -65,19 +65,19 @@ COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
         "hf_pyramid_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
             proportion=0.05, 
             slope_range=(0.0, 0.9),  
-            platform_width=4.0,  
+            platform_width=3.0,  
             border_width=0.0,
         ),
         "hf_pyramid_slope_inv": terrain_gen.HfInvertedPyramidSlopedTerrainCfg(
             proportion=0.05, 
             slope_range=(0.0, 0.9),  
-            platform_width=4.0,
+            platform_width=3.0,
             border_width=0.0,  
         ),
         "hf_slope_with_noise": him_terrains.HfPyramidSlopeWithNoiseCfg(
             proportion=0.05,
             slope_range=(0.0, 0.9),
-            platform_width=4.0,
+            platform_width=3.0,
             border_width=0.0,
             noise_amplitude_range=(0.01, 0.08),
             noise_step=0.005,
@@ -86,7 +86,7 @@ COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
         "hf_slope_inv_with_noise": him_terrains.HfPyramidSlopeWithNoiseCfg(
             proportion=0.05,
             slope_range=(0.0, 0.9),
-            platform_width=4.0,
+            platform_width=3.0,
             border_width=0.0,
             noise_amplitude_range=(0.01, 0.08),
             noise_step=0.005,
@@ -96,7 +96,7 @@ COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
         "hf_slope_with_noise": him_terrains.HfPyramidSlopeWithNoiseCfg(
             proportion=0.05,
             slope_range=(0.0, 0.9),
-            platform_width=4.0,
+            platform_width=3.0,
             border_width=0.0,
             noise_amplitude_range=(0.01, 0.08),
             noise_step=0.005,
@@ -108,7 +108,7 @@ COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
             max_height_range=(0.05, 0.4),  # 0.05 + 0.1 * difficulty
             obstacle_size_range=(2.0, 4.0),  # min=1m, max=3m
             num_obstacles=20,
-            platform_width=6.0,
+            platform_width=3.0,
         ),
         # 随机粗糙地形
         "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
@@ -373,9 +373,9 @@ class CommandsCfg:
             "hf_pyramid_slope_inv": (-2.0, 2.0),
             "hf_slope_with_noise": (-2.0, 2.0),
 
-            "random_rough": (-2.0, 3.0),
-            "wave": (-2.0, 3.0),
-            "flat": (-2.0, 3.0),
+            "random_rough": (-3.0, 3.0),
+            "wave": (-3.0, 3.0),
+            "flat": (-3.0, 3.0),
         },
     )
 
@@ -490,6 +490,20 @@ class RewardsCfg:
     #         "sensor_cfg": SceneEntityCfg("base_height_scanner"),
     #     },
     # )
+
+    base_height_exp = RewTerm(
+        func=mdp.base_height_target_exp,
+        weight=0.25,  # 温和且稳定的正奖励：平地防蹲走/防触地，爬坡爬楼区间内自动满分不干扰步态
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base"),
+            "target_height": 0.76,          # 对齐 AMP 平地自然行走高度 
+            "std": 0.06,
+            "flat_tolerance": 0.04,         # 平地满分走廊: [0.72m, 0.8m]
+            "max_crouch_drop": 0.14,        # 陡坡/楼梯自动下探至 0.52m 仍满分
+            "min_safe_clearance": 0.5,     # 绝对防触地安全红线
+            "sensor_cfg": SceneEntityCfg("base_height_scanner"),
+        },
+    )
     # feet_height_body = RewTerm(
     #     func=mdp.feet_height_body,
     #     weight=-0.1, #-0.01,
@@ -504,7 +518,7 @@ class RewardsCfg:
         weight=0.1,
         params={
             "asset_cfg": SceneEntityCfg(
-                "robot", body_names=".*_foot"),
+                "robot", body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"]),
             "scan_sensor_names": [
                 "fl_foot_scan",
                 "fr_foot_scan",
@@ -547,21 +561,39 @@ class RewardsCfg:
     #     },
     # )
 
+    # joint_torques_over_rating = RewTerm(
+    #     func=mdp.joint_torques_over_rating_l2,
+    #     weight=-0.08, #-0.25,  # 配合内部 torch.mean 与动态时间放大，平时仅约 -0.005，接近 3s 时自动放大至 -0.5 以上
+    #     params={
+    #         "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+    #         "ratings": {
+    #             ".*_hip_joint": 420.0,
+    #             ".*_thigh_joint": 420.0,
+    #             ".*_calf_joint": 600.0,
+    #         },
+    #         "max_over_time_s": 3.0,         # 驱动器保护时间阈值 3.0 秒
+    #         "cool_down_rate": 1.5,          # 低于额定扭矩时的冷却恢复速率
+    #         "soft_ratio": 0.85,             # 95% 额定扭矩起算超额量
+    #         "continuous_safe_ratio": 0.88,
+    #         "burst_grace_time_s": 0.8,      # 0.8s 内爆发免责
+    #         "base_l2_coef": 0.02,           # 额定扭矩内极温和的均载偏好
+    #         "time_escalation_gain": 25.0,    # 持续超额接近 3s 时的最大惩罚放大倍数
+    #         "thermal_balance_coef": 0.2,
+    #     },
+    # )
+
     joint_torques_over_rating = RewTerm(
         func=mdp.joint_torques_over_rating_l2,
-        weight=-0.25,  # 配合内部 torch.mean 与动态时间放大，平时仅约 -0.005，接近 3s 时自动放大至 -0.5 以上
+        weight=-0.08,
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
             "ratings": {
-                ".*_hip_joint": 420.0,
-                ".*_thigh_joint": 420.0,
-                ".*_calf_joint": 600.0,
+                ".*_hip_joint": 550.0,
+                ".*_thigh_joint": 530.0,
+                ".*_calf_joint": 760.0,
             },
-            "max_over_time_s": 3.0,         # 驱动器保护时间阈值 3.0 秒
-            "cool_down_rate": 1.5,          # 低于额定扭矩时的冷却恢复速率
-            "soft_ratio": 0.95,             # 95% 额定扭矩起算超额量
-            "base_l2_coef": 0.02,           # 额定扭矩内极温和的均载偏好
-            "time_escalation_gain": 40.0,    # 持续超额接近 3s 时的最大惩罚放大倍数
+            "soft_ratio": 0.78,    # 78% CL[1] 起算，远离驱动器 90% CL[1] 迟滞死锁线
+            "base_l2_coef": 0.04,  # 持续压低最差单腿扭矩并缩短力臂
         },
     )
     joint_vel = RewTerm(func=mdp.joint_vel_l2, weight=-1e-5)  #-0.0001
@@ -649,7 +681,7 @@ class RewardsCfg:
         weight=-0.01, #-0.01,#0.005 #-0.05,
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_thigh_joint", ".*_calf_joint"]),
-            "stand_still_scale": 25.0, #200.0, #50.0, #25.0,
+            "stand_still_scale": 10.0, #25.0, #200.0, #50.0, #25.0,
             "velocity_threshold": 0.2,
             "target_height": 0.8,
         },
@@ -681,7 +713,7 @@ class RewardsCfg:
         func=mdp.sound_suppression_acc_per_foot,
         weight=-0.001,
         params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"]),
             "command_name": "base_velocity",
             "scan_sensor_names": [
                 "fl_foot_scan",
@@ -727,14 +759,27 @@ class RewardsCfg:
     #     },
     # )
     # 启用归一化站立Z轴力均衡惩罚
+    # force_variance = RewTerm(
+    #     func=mdp.stand_z_force_variance_penalty,
+    #     weight=-1.0,  # 因内部已做承重比归一化，权重直接设为 -1.0
+    #     params={
+    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+    #         "command_name": "base_velocity",
+    #         "stand_threshold": 0.1,
+    #         "min_foot_load_ratio": 0.15,
+    #     },
+    # )
     force_variance = RewTerm(
         func=mdp.stand_z_force_variance_penalty,
-        weight=-1.0,  # 因内部已做承重比归一化，权重直接设为 -1.0
+        weight=-0.5,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
             "command_name": "base_velocity",
             "stand_threshold": 0.1,
-            "min_foot_load_ratio": 0.15,
+            "min_foot_load_ratio": 0.16,
+            "max_foot_load_ratio": 0.34,
+            "foot_align_tol": 0.12,
+            "max_stance_time_s": 0.65,
         },
     )
     feet_slide = RewTerm(
@@ -747,14 +792,14 @@ class RewardsCfg:
         },
     )
 
-    # feet_contact_without_cmd  = RewTerm(
-    #     func=mdp.feet_contact_without_cmd,
-    #     weight=1.0,
-    #     params={
-    #         "command_name": "base_velocity",
-    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
-    #     },
-    # )
+    feet_contact_without_cmd = RewTerm(
+        func=mdp.feet_contact_without_cmd,
+        weight=0.4,
+        params={
+            "command_name": "base_velocity",
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+        },
+    )
 
     # feet_gait = RewTerm(
     #     func=mdp.feet_gait,

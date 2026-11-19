@@ -45,7 +45,7 @@ class AMPPPORunnerCfg(AMPOnPolicyRunnerCfg):
         amp_replay_buffer_size=1000000,
     )
     amp_motion_files = _AMP_MOTION_FILES
-    amp_reward_coef = 0.002 #0.002 #0.06 #0.03 # #0.3 #0.5 * 0.02 #0.3
+    amp_reward_coef = 0.03 #0.002 #0.002 #0.06 #0.03 # #0.3 #0.5 * 0.02 #0.3
     """Coefficient for AMP style reward."""
     amp_task_reward_lerp = 0.7 #0.5 #0.3 #0.7
     """Ratio to lerp between task reward and style reward."""
